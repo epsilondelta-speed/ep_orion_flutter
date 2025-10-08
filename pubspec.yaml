@@ -1,0 +1,18 @@
+name: orion_flutter
+description: Orion Flutter SDK (binary-only)
+version: 1.0.2
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: co.epsilondelta.orion_flutter
+        pluginClass: OrionFlutterPlugin
+
+environment:
+  sdk: ">=2.17.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+
