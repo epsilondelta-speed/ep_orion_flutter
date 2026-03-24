@@ -17,6 +17,7 @@ rootProject.allprojects {
     repositories {
         google()
         mavenCentral()
+        /*
         maven {
             name = "GitHubPackages"
             url = uri("https://maven.pkg.github.com/epsilondelta-speed/orion-flutter")
@@ -24,7 +25,8 @@ rootProject.allprojects {
                 username = project.findProperty("gpr.orionuser") ?: System.getenv("ORION_USERNAME")
                 password = project.findProperty("gpr.orionkey") ?: System.getenv("ORION_GITHUB_TOKEN")
             }
-        }
+        }*/
+        maven { url "https://raw.githubusercontent.com/epsilondelta-speed/orion-flutter/main/maven" }
     }
 }
 
@@ -51,7 +53,7 @@ android {
 
 dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8:$kotlin_version"
-implementation('co.epsilondelta:orion-flutter:1.0.17') {
+    implementation('co.epsilondelta:orion-flutter:1.2.3') {
         exclude group: 'io.flutter', module: 'flutter_embedding_release'
     }
    // Debug build: bring in the plugin but strip out its embedded release-engine
