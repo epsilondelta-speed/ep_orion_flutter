@@ -4,10 +4,12 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'orion_flutter_platform_interface.dart';
 import 'orion_sampling_manager.dart';
+import 'orion_http_overrides.dart';
 
 export 'orion_wake_lock.dart';
 export 'orion_rage_click_tracker.dart';
 export 'orion_rage_click_detector.dart';
+export 'orion_http_overrides.dart';   // ← export so client can use directly
 
 class OrionFlutter {
   static const MethodChannel _channel = MethodChannel('orion_flutter');
@@ -16,25 +18,32 @@ class OrionFlutter {
   static String? _lastException;
   static DateTime? _lastErrorTime;
 
-  // ✅ Supports both Android and iOS
   static bool get isAndroid   => Platform.isAndroid;
   static bool get isIOS       => Platform.isIOS;
   static bool get isSupported => Platform.isAndroid || Platform.isIOS;
 
-  // ─── Init ────────────────────────────────────────────────────────────────
+  // ─── Init ─────────────────────────────────────────────────────────────────
 
   /// Initializes Orion SDK on both Android and iOS.
   ///
-  /// [sampleRate] — local fallback sampling rate (0.0–1.0, default 1.0 = 100%).
-  /// CDN config overrides this once loaded.
+  /// [sampleRate] — local fallback sampling rate (0.0–1.0, default 1.0).
+  /// [trackAllHttp] — if true, installs HttpOverrides to track ALL HTTP
+  ///   requests including cached_network_image, http package etc.
+  ///   Defaults to false — set true if client uses cached_network_image.
   static Future<String?> initializeEdOrion({
     required String cid,
     required String pid,
     double sampleRate = 1.0,
+    bool trackAllHttp = false,   // ← NEW param
   }) async {
     if (!isSupported) return Future.value("Skipped: unsupported platform");
 
-    // ✅ Initialize sampling manager — fire-and-forget CDN fetch
+    // ✅ Install global HTTP interceptor if requested
+    if (trackAllHttp) {
+      OrionHttpOverrides.install();
+    }
+
+    // Initialize sampling manager
     SamplingManager.instance.initialize(cid, pid, sampleRate: sampleRate);
 
     return await _channel.invokeMethod<String>('initializeEdOrion', {
@@ -53,7 +62,6 @@ class OrionFlutter {
   }
 
   // ─── Error Tracking ───────────────────────────────────────────────────────
-  // Crash beacons bypass sampling — always send
 
   static Future<void> trackFlutterErrorRaw({
     required String exception,
@@ -127,14 +135,12 @@ class OrionFlutter {
   }) async {
     if (!isSupported) return;
 
-    // ✅ Sampling gate — drop beacon if sampled out
     if (!SamplingManager.instance.shouldSend()) {
       debugPrint('[Orion] Beacon dropped by sampling '
           '(effective: ${SamplingManager.instance.getEffectivePercent()}%)');
       return;
     }
 
-    // Full beacon preview in Flutter console
     final beaconPreview = <String, dynamic>{
       "screen":         screen,
       "ttid":           ttid,
@@ -208,12 +214,9 @@ class OrionFlutter {
 
   // ─── Sampling Debug ───────────────────────────────────────────────────────
 
-  /// Returns current effective sampling percent (0–100).
-  /// Useful for debug UI or logging.
   static int get effectiveSamplingPercent =>
       SamplingManager.instance.getEffectivePercent();
 
-  /// Returns whether CDN sampling config has loaded.
   static bool get isSamplingConfigLoaded =>
       SamplingManager.instance.isConfigLoaded;
 }
