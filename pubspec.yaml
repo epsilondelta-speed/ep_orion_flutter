@@ -11,7 +11,7 @@ flutter:
         pluginClass: OrionFlutterPlugin
 
 environment:
-  sdk: ">=2.17.0 <4.0.0"
+  sdk: ">=2.18.0 <4.0.0"
 
 dependencies:
   flutter:
