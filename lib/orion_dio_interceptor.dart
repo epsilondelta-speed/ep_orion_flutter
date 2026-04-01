@@ -13,6 +13,7 @@
 /// - Captures response status codes and payload sizes
 /// - Records errors with messages
 /// - Associates requests with current screen
+/// - Fully error-safe — any internal failure is caught and logged silently
 ///
 /// Requirements:
 /// - Set current screen via OrionNetworkTracker.setCurrentScreen() or use OrionScreenTracker
@@ -39,143 +40,171 @@ class OrionDioInterceptor extends Interceptor {
 
   @override
   void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
-    if (!OrionFlutter.isSupported) {
-      return handler.next(options);
+    try {
+      if (!OrionFlutter.isSupported) {
+        return handler.next(options);
+      }
+
+      // Record start time
+      options.extra['startTime'] = DateTime.now().millisecondsSinceEpoch;
+
+      if (verbose) {
+        orionPrint("🌐 [Orion] Request: ${options.method} ${options.uri}");
+      }
+    } catch (e) {
+      // Never let Orion tracking crash the client's request
+      orionPrint("⚠️ [Orion] onRequest tracking error (ignored): $e");
+    } finally {
+      // Always forward the request regardless of tracking outcome
+      handler.next(options);
     }
-
-    // Record start time
-    options.extra['startTime'] = DateTime.now().millisecondsSinceEpoch;
-
-    if (verbose) {
-      orionPrint("🌐 [Orion] Request: ${options.method} ${options.uri}");
-    }
-
-    super.onRequest(options, handler);
   }
 
   @override
   void onResponse(Response response, ResponseInterceptorHandler handler) {
-    if (OrionFlutter.isSupported) {
-      // Extract server processing time header (if available)
-      final processingTimeStr = response.headers['x-response-time']?.first;
-      final processingTime = int.tryParse(processingTimeStr ?? '') ?? 0;
+    try {
+      if (OrionFlutter.isSupported) {
+        final processingTimeStr =
+            response.headers['x-response-time']?.first;
+        final processingTime =
+            int.tryParse(processingTimeStr ?? '') ?? 0;
 
-      _trackRequest(
-        response.requestOptions,
-        response.statusCode ?? -1,
-        payload: response.data,
-        contentType: response.headers[HttpHeaders.contentTypeHeader]?.first,
-        actualTime: processingTime,
-      );
+        _trackRequest(
+          response.requestOptions,
+          response.statusCode ?? -1,
+          payload: response.data,
+          contentType:
+              response.headers[HttpHeaders.contentTypeHeader]?.first,
+          actualTime: processingTime,
+        );
 
-      if (verbose) {
-        orionPrint("✅ [Orion] Response: ${response.statusCode} ${response.requestOptions.uri}");
+        if (verbose) {
+          orionPrint(
+              "✅ [Orion] Response: ${response.statusCode} "
+              "${response.requestOptions.uri}");
+        }
       }
+    } catch (e) {
+      // Never let Orion tracking crash the client's response handling
+      orionPrint("⚠️ [Orion] onResponse tracking error (ignored): $e");
+    } finally {
+      // Always forward the response regardless of tracking outcome
+      handler.next(response);
     }
-
-    super.onResponse(response, handler);
   }
 
   @override
   void onError(DioException err, ErrorInterceptorHandler handler) {
-    if (OrionFlutter.isSupported) {
-      final statusCode = err.response?.statusCode ?? -1;
+    try {
+      if (OrionFlutter.isSupported) {
+        final statusCode = err.response?.statusCode ?? -1;
 
-      orionPrint(
-          "🔴 [Orion] Error: [${err.requestOptions.method}] ${err.requestOptions.uri} | "
-              "Status: $statusCode | ${err.type.name}: ${err.message}"
-      );
+        orionPrint(
+            "🔴 [Orion] Error: [${err.requestOptions.method}] "
+            "${err.requestOptions.uri} | "
+            "Status: $statusCode | "
+            "${err.type.name}: ${err.message}");
 
-      _trackRequest(
-        err.requestOptions,
-        statusCode,
-        error: _formatErrorMessage(err),
-        contentType: err.response?.headers[HttpHeaders.contentTypeHeader]?.first,
-        actualTime: 0,
-      );
+        _trackRequest(
+          err.requestOptions,
+          statusCode,
+          error: _formatErrorMessage(err),
+          contentType:
+              err.response?.headers[HttpHeaders.contentTypeHeader]?.first,
+          actualTime: 0,
+        );
+      }
+    } catch (e) {
+      // Never let Orion tracking crash the client's error handling
+      orionPrint("⚠️ [Orion] onError tracking error (ignored): $e");
+    } finally {
+      // Always forward the error regardless of tracking outcome
+      handler.next(err);
     }
-
-    super.onError(err, handler);
   }
 
   /// Format error message with type information
   String _formatErrorMessage(DioException err) {
-    final buffer = StringBuffer();
+    try {
+      final buffer = StringBuffer();
+      buffer.write('[${err.type.name}] ');
 
-    // Add error type
-    buffer.write('[${err.type.name}] ');
-
-    // Add message
-    if (err.message != null && err.message!.isNotEmpty) {
-      buffer.write(err.message);
-    } else {
-      // Provide default message based on type
-      switch (err.type) {
-        case DioExceptionType.connectionTimeout:
-          buffer.write('Connection timeout');
-          break;
-        case DioExceptionType.sendTimeout:
-          buffer.write('Send timeout');
-          break;
-        case DioExceptionType.receiveTimeout:
-          buffer.write('Receive timeout');
-          break;
-        case DioExceptionType.badCertificate:
-          buffer.write('Bad SSL certificate');
-          break;
-        case DioExceptionType.badResponse:
-          buffer.write('Bad response: ${err.response?.statusCode}');
-          break;
-        case DioExceptionType.cancel:
-          buffer.write('Request cancelled');
-          break;
-        case DioExceptionType.connectionError:
-          buffer.write('Connection error');
-          break;
-        case DioExceptionType.unknown:
-        default:
-          buffer.write('Unknown error');
-          break;
+      if (err.message != null && err.message!.isNotEmpty) {
+        buffer.write(err.message);
+      } else {
+        switch (err.type) {
+          case DioExceptionType.connectionTimeout:
+            buffer.write('Connection timeout');
+            break;
+          case DioExceptionType.sendTimeout:
+            buffer.write('Send timeout');
+            break;
+          case DioExceptionType.receiveTimeout:
+            buffer.write('Receive timeout');
+            break;
+          case DioExceptionType.badCertificate:
+            buffer.write('Bad SSL certificate');
+            break;
+          case DioExceptionType.badResponse:
+            buffer.write('Bad response: ${err.response?.statusCode}');
+            break;
+          case DioExceptionType.cancel:
+            buffer.write('Request cancelled');
+            break;
+          case DioExceptionType.connectionError:
+            buffer.write('Connection error');
+            break;
+          case DioExceptionType.unknown:
+          default:
+            buffer.write('Unknown error');
+            break;
+        }
       }
-    }
 
-    return buffer.toString();
+      return buffer.toString();
+    } catch (e) {
+      return 'Error formatting message: $e';
+    }
   }
 
   /// Track request in OrionNetworkTracker
   void _trackRequest(
-      RequestOptions options,
-      int statusCode, {
-        String? error,
-        dynamic payload,
-        String? contentType,
-        int actualTime = 0,
-      }) {
-    final startTime = options.extra['startTime'] as int?;
-    final endTime = DateTime.now().millisecondsSinceEpoch;
+    RequestOptions options,
+    int statusCode, {
+    String? error,
+    dynamic payload,
+    String? contentType,
+    int actualTime = 0,
+  }) {
+    try {
+      final startTime = options.extra['startTime'] as int?;
+      final endTime   = DateTime.now().millisecondsSinceEpoch;
 
-    if (startTime == null) {
-      orionPrint("⚠️ [Orion] Missing startTime for ${options.uri}");
-      return;
+      if (startTime == null) {
+        orionPrint("⚠️ [Orion] Missing startTime for ${options.uri}");
+        return;
+      }
+
+      final duration    = endTime - startTime;
+      final screen      = OrionNetworkTracker.currentScreenName ?? "UnknownScreen";
+      final payloadSize = _getPayloadSize(payload);
+
+      OrionNetworkTracker.addRequest(screen, {
+        "method":       options.method,
+        "url":          options.uri.toString(),
+        "statusCode":   statusCode,
+        "startTime":    startTime,
+        "endTime":      endTime,
+        "duration":     duration,
+        "payloadSize":  payloadSize,
+        "contentType":  contentType,
+        "responseType": options.responseType.toString(),
+        "errorMessage": error,
+        "actualTime":   actualTime,
+      });
+    } catch (e) {
+      orionPrint("⚠️ [Orion] _trackRequest error (ignored): $e");
     }
-
-    final duration = endTime - startTime;
-    final screen = OrionNetworkTracker.currentScreenName ?? "UnknownScreen";
-    final payloadSize = _getPayloadSize(payload);
-
-    OrionNetworkTracker.addRequest(screen, {
-      "method": options.method,
-      "url": options.uri.toString(),
-      "statusCode": statusCode,
-      "startTime": startTime,
-      "endTime": endTime,
-      "duration": duration,
-      "payloadSize": payloadSize,
-      "contentType": contentType,
-      "responseType": options.responseType.toString(),
-      "errorMessage": error,
-      "actualTime": actualTime,
-    });
   }
 
   /// Calculate payload size
@@ -184,14 +213,13 @@ class OrionDioInterceptor extends Interceptor {
 
     try {
       if (data is List<int>) return data.length;
-      if (data is String) return data.length;
+      if (data is String)    return data.length;
       if (data is Map || data is List) {
-        // Limit toString() to avoid memory issues with large payloads
         final str = data.toString();
         return str.length > 100000 ? 100000 : str.length;
       }
     } catch (e) {
-      orionPrint("⚠️ [Orion] Error calculating payload size: $e");
+      orionPrint("⚠️ [Orion] Error calculating payload size (ignored): $e");
     }
 
     return null;
