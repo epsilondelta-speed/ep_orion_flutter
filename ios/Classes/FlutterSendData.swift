@@ -2,6 +2,11 @@ import Foundation
 
 /// FlutterSendData — Assembles the full beacon JSON and sends via SendData.
 /// Mirrors FlutterSendData.kt exactly + adds iOS-specific fields.
+///
+/// Double-sampling fix: uses coronaGoForced() instead of coronaGo().
+/// The Dart SamplingManager already decided to send this beacon before calling
+/// the Swift method channel.  coronaGo() would apply a second independent iOS
+/// sampling roll, silently reducing delivery rate below the intended percentage.
 final class FlutterSendData {
 
     // MARK: - Singleton
@@ -24,16 +29,13 @@ final class FlutterSendData {
         rageClicks:      [[String: Any]] = [],
         rageClickCount:  Int     = 0
     ) {
-        // Sample memory on screen transition
         MemoryMetricsTracker.shared.onScreenTransition()
 
-        // Collect native metrics
         let batteryMetrics  = BatteryMetricsTracker.shared.getSessionMetrics()
         let memoryMetrics   = MemoryMetricsTracker.shared.getSessionMetrics()
         let wakeLockMetrics = WakeLockTracker.shared.getSessionMetrics()
         let staticMetrics   = AppMetrics.shared.getAppMetrics()
 
-        // Build beacon — mirrors Kotlin finalMetrics JSONObject exactly
         var beacon: [String: Any] = [
             "flutter":      1,
             "screen":       screenName,
@@ -49,10 +51,8 @@ final class FlutterSendData {
 
         if wentBg { beacon["bgCount"] = bgCount }
 
-        // Frame metrics (pure Dart computation — passed through)
         if let fm = frameMetrics { beacon["frameMetrics"] = fm }
 
-        // Battery (mirrors Kotlin key mapping exactly)
         beacon["sesBatSt"]          = batteryMetrics["sessionBatteryStart"]
         beacon["sesBatCur"]         = batteryMetrics["sessionBatteryCurrent"]
         beacon["sesBatDrain"]       = batteryMetrics["sessionBatteryDrain"]
@@ -65,28 +65,31 @@ final class FlutterSendData {
         beacon["sesTimedOut"]       = batteryMetrics["sessionTimedOut"]
         beacon["batIsCharging"]     = batteryMetrics["isCharging"]
 
-        // Memory
         beacon["mem"] = memoryMetrics
 
-        // Wake lock
         if !wakeLockMetrics.isEmpty { beacon["wl"] = wakeLockMetrics }
 
-        // Rage clicks (only if present — saves bandwidth)
         if rageClickCount > 0 {
             beacon["rageClicks"]     = buildRageClicksArray(rageClicks)
             beacon["rageClickCount"] = rageClickCount
         }
 
-        // ✅ iOS-specific health metrics — not in Android beacons
+        // iOS-specific health — not in Android beacons.
+        // Set here explicitly; AppMetrics.getAppMetrics() no longer duplicates it
+        // so there is exactly one call to iOSHealthTracker.getSessionMetrics() per beacon.
         beacon["iosHealth"] = iOSHealthTracker.shared.getSessionMetrics()
 
-        // Merge static device/app metrics (don't overwrite existing keys)
+        // Merge static device/app metrics (don't overwrite existing keys).
         for (key, value) in staticMetrics {
             if beacon[key] == nil { beacon[key] = value }
         }
 
         OrionLogger.debug("FlutterSendData: 📤 Sending beacon for '\(screenName)'")
-        SendData().coronaGo(beacon)
+
+        // ✅ coronaGoForced — Dart SamplingManager already gated this beacon.
+        //    Using coronaGo() would apply a second independent iOS sampling roll,
+        //    e.g. 80% Dart × 90% iOS = 72% actual delivery (not 80%).
+        SendData().coronaGoForced(beacon)
     }
 
     // MARK: - Network Array Builder

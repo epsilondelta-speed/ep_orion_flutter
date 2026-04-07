@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -9,7 +8,7 @@ import 'orion_http_overrides.dart';
 export 'orion_wake_lock.dart';
 export 'orion_rage_click_tracker.dart';
 export 'orion_rage_click_detector.dart';
-export 'orion_http_overrides.dart';   // ← export so client can use directly
+export 'orion_http_overrides.dart';
 
 class OrionFlutter {
   static const MethodChannel _channel = MethodChannel('orion_flutter');
@@ -22,34 +21,32 @@ class OrionFlutter {
   static bool get isIOS       => Platform.isIOS;
   static bool get isSupported => Platform.isAndroid || Platform.isIOS;
 
-  // ─── Init ─────────────────────────────────────────────────────────────────
+  // ── Init ──────────────────────────────────────────────────────────────────
 
   /// Initializes Orion SDK on both Android and iOS.
-  ///
-  /// [sampleRate] — local fallback sampling rate (0.0–1.0, default 1.0).
-  /// [trackAllHttp] — if true, installs HttpOverrides to track ALL HTTP
-  ///   requests including cached_network_image, http package etc.
-  ///   Defaults to false — set true if client uses cached_network_image.
   static Future<String?> initializeEdOrion({
     required String cid,
     required String pid,
     double sampleRate = 1.0,
-    bool trackAllHttp = false,   // ← NEW param
+    bool trackAllHttp = false,
   }) async {
-    if (!isSupported) return Future.value("Skipped: unsupported platform");
+    if (!isSupported) return 'Skipped: unsupported platform';
 
-    // ✅ Install global HTTP interceptor if requested
-    if (trackAllHttp) {
-      OrionHttpOverrides.install();
+    try {
+      if (trackAllHttp) {
+        OrionHttpOverrides.install(); // already wrapped in try-catch internally
+      }
+
+      SamplingManager.instance.initialize(cid, pid, sampleRate: sampleRate);
+
+      return await _channel.invokeMethod<String>('initializeEdOrion', {
+        'cid': cid,
+        'pid': pid,
+      });
+    } catch (e) {
+      debugPrint('[Orion] initializeEdOrion error — $e');
+      return null;
     }
-
-    // Initialize sampling manager
-    SamplingManager.instance.initialize(cid, pid, sampleRate: sampleRate);
-
-    return await _channel.invokeMethod<String>('initializeEdOrion', {
-      'cid': cid,
-      'pid': pid,
-    });
   }
 
   static Future<String?> getPlatformVersion() {
@@ -61,7 +58,9 @@ class OrionFlutter {
     return OrionFlutterPlatform.instance.getRuntimeMetrics();
   }
 
-  // ─── Error Tracking ───────────────────────────────────────────────────────
+  // ── Error Tracking ────────────────────────────────────────────────────────
+
+  // Error beacons are NEVER gated by sampling — they always send.
 
   static Future<void> trackFlutterErrorRaw({
     required String exception,
@@ -80,8 +79,8 @@ class OrionFlutter {
     }
 
     _isReportingError = true;
-    _lastException   = exception;
-    _lastErrorTime   = DateTime.now();
+    _lastException    = exception;
+    _lastErrorTime    = DateTime.now();
 
     try {
       await _channel.invokeMethod('trackFlutterError', {
@@ -89,7 +88,7 @@ class OrionFlutter {
         'stack':     stack,
         'library':   library ?? '',
         'context':   context ?? '',
-        'screen':    screen ?? 'UnknownScreen',
+        'screen':    screen  ?? 'UnknownScreen',
         'network':   network ?? [],
       });
     } catch (_) {
@@ -117,7 +116,7 @@ class OrionFlutter {
     }
   }
 
-  // ─── Screen Beacon ────────────────────────────────────────────────────────
+  // ── Screen Beacon ─────────────────────────────────────────────────────────
 
   static Future<void> trackFlutterScreen({
     required String screen,
@@ -135,50 +134,46 @@ class OrionFlutter {
   }) async {
     if (!isSupported) return;
 
-    if (!SamplingManager.instance.shouldSend()) {
-      debugPrint('[Orion] Beacon dropped by sampling '
-          '(effective: ${SamplingManager.instance.getEffectivePercent()}%)');
-      return;
+    try {
+      if (!SamplingManager.instance.shouldSend()) {
+        debugPrint('[Orion] Beacon dropped by sampling '
+            '(effective: ${SamplingManager.instance.getEffectivePercent()}%)');
+        return;
+      }
+
+      // ✅ Verbose beacon preview is guarded by kDebugMode so it never runs
+      //    in production, avoiding the cost of JsonEncoder.withIndent on every
+      //    screen transition.
+      if (kDebugMode) {
+        debugPrint(
+          '\n========== ORION BEACON (Dart) ==========\n'
+          'screen=$screen ttid=$ttid ttfd=$ttfd '
+          'janky=$jankyFrames frozen=$frozenFrames '
+          'network=${network.length} rageClicks=$rageClickCount'
+          '\n=========================================',
+        );
+      }
+
+      await _channel.invokeMethod('trackFlutterScreen', {
+        'screen':         screen,
+        'ttid':           ttid,
+        'ttfd':           ttfd,
+        'ttfdManual':     ttfdManual,
+        'jankyFrames':    jankyFrames,
+        'frozenFrames':   frozenFrames,
+        'network':        network,
+        'frameMetrics':   frameMetrics,
+        'wentBg':         wentBg,
+        'bgCount':        bgCount,
+        'rageClicks':     rageClicks,
+        'rageClickCount': rageClickCount,
+      });
+    } catch (e) {
+      debugPrint('[Orion] trackFlutterScreen error — $e');
     }
-
-    final beaconPreview = <String, dynamic>{
-      "screen":         screen,
-      "ttid":           ttid,
-      "ttfd":           ttfd,
-      "ttfdManual":     ttfdManual,
-      "jankyFrames":    jankyFrames,
-      "frozenFrames":   frozenFrames,
-      "wentBg":         wentBg,
-      "bgCount":        bgCount,
-      "rageClickCount": rageClickCount,
-      "networkCount":   network.length,
-      "network":        network,
-      "rageClicks":     rageClicks,
-      "frameMetrics":   frameMetrics,
-    };
-    debugPrint(
-      "\n========== ORION BEACON (Dart) ==========\n"
-      "${JsonEncoder.withIndent('  ').convert(beaconPreview)}"
-      "\n=========================================",
-    );
-
-    await _channel.invokeMethod("trackFlutterScreen", {
-      "screen":         screen,
-      "ttid":           ttid,
-      "ttfd":           ttfd,
-      "ttfdManual":     ttfdManual,
-      "jankyFrames":    jankyFrames,
-      "frozenFrames":   frozenFrames,
-      "network":        network,
-      'frameMetrics':   frameMetrics,
-      "wentBg":         wentBg,
-      "bgCount":        bgCount,
-      "rageClicks":     rageClicks,
-      "rageClickCount": rageClickCount,
-    });
   }
 
-  // ─── App Lifecycle ────────────────────────────────────────────────────────
+  // ── App Lifecycle ─────────────────────────────────────────────────────────
 
   static Future<void> onAppForeground() async {
     if (!isSupported) return;
@@ -212,7 +207,7 @@ class OrionFlutter {
     });
   }
 
-  // ─── Sampling Debug ───────────────────────────────────────────────────────
+  // ── Sampling Debug ────────────────────────────────────────────────────────
 
   static int get effectiveSamplingPercent =>
       SamplingManager.instance.getEffectivePercent();

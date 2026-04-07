@@ -2,18 +2,20 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'orion_network_tracker.dart';
+import 'orion_sampling_manager.dart';
 
 /// OrionHttpOverrides — Global HTTP interceptor for Orion SDK.
 /// Intercepts ALL dart:io HTTP requests including cached_network_image.
 ///
-/// Usage — add ONE line to main() before runApp:
-/// ```dart
-/// void main() {
-///   HttpOverrides.global = OrionHttpOverrides();
-///   OrionFlutter.initializeEdOrion(cid: '...', pid: '...');
-///   runApp(MyApp());
-/// }
-/// ```
+/// Critical bug fix: previously, if _track() threw an exception after a
+/// successful HTTP response, that exception was caught by the outer try/catch,
+/// _trackError() was called with the tracking error (not a network error), and
+/// then rethrow propagated the tracking failure to the caller — turning a
+/// successful HTTP response into an apparent error. Fixed by isolating tracking
+/// in its own try/catch that never re-throws.
+///
+/// Sampling: _track() and _trackError() are no-ops when
+/// SamplingManager.instance.isTrackingEnabled is false.
 class OrionHttpOverrides extends HttpOverrides {
 
   final HttpOverrides? _previous;
@@ -30,13 +32,17 @@ class OrionHttpOverrides extends HttpOverrides {
 
   /// Install globally — safely chains with any existing HttpOverrides.
   static void install() {
-    final existing = HttpOverrides.current;
-    HttpOverrides.global = OrionHttpOverrides(previous: existing);
-    debugPrint('[Orion] HttpOverrides: installed');
+    try {
+      final existing = HttpOverrides.current;
+      HttpOverrides.global = OrionHttpOverrides(previous: existing);
+      debugPrint('[Orion] HttpOverrides: installed');
+    } catch (e) {
+      debugPrint('[Orion] HttpOverrides: install error — $e');
+    }
   }
 }
 
-// ─── Top-level helpers ───────────────────────────────────────────────────────
+// ─── Top-level helpers ────────────────────────────────────────────────────────
 
 const int _kMaxUrlLength = 200;
 
@@ -45,7 +51,7 @@ String _capUrl(String url) {
   try {
     final uri = Uri.tryParse(url);
     if (uri == null) return url.substring(0, _kMaxUrlLength);
-    final base = '${uri.scheme}://${uri.host}${uri.path}';
+    final base  = '${uri.scheme}://${uri.host}${uri.path}';
     final query = uri.query;
     if (query.isEmpty) return base;
     return '$base?${query.length > 50 ? query.substring(0, 50) : query}';
@@ -65,7 +71,7 @@ String _inferContentType(String url) {
   return 'other';
 }
 
-// ─── Wrapped HttpClient ──────────────────────────────────────────────────────
+// ─── Wrapped HttpClient ───────────────────────────────────────────────────────
 
 class _OrionHttpClient implements HttpClient {
   final HttpClient _inner;
@@ -155,7 +161,7 @@ class _OrionHttpClient implements HttpClient {
   @override void close({bool force = false}) => _inner.close(force: force);
 }
 
-// ─── Wrapped HttpClientRequest ───────────────────────────────────────────────
+// ─── Wrapped HttpClientRequest ────────────────────────────────────────────────
 
 class _OrionHttpClientRequest implements HttpClientRequest {
   final HttpClientRequest _inner;
@@ -171,44 +177,70 @@ class _OrionHttpClientRequest implements HttpClientRequest {
 
   @override
   Future<HttpClientResponse> close() async {
+    HttpClientResponse? response;
     try {
-      final response = await _inner.close();
-      _track(response.statusCode, contentLength: response.contentLength);
-      return response;
-    } catch (e) {
-      _trackError(e.toString());
-      rethrow;
+      response = await _inner.close();
+    } catch (networkError) {
+      // Real network failure — track it, then rethrow the *network* error.
+      try {
+        _trackError(networkError.toString());
+      } catch (_) {
+        // Swallow any tracking failure so rethrow below uses the original error.
+      }
+      rethrow; // ✅ rethrow the original network error, not a tracking error
     }
+
+    // ✅ Critical fix: wrap tracking in its own try/catch so a tracking failure
+    //    can never turn a successful HTTP response into an apparent error.
+    //    Before this fix, _track() throwing would be caught by the outer catch,
+    //    then rethrow would propagate the tracking exception to the caller.
+    try {
+      _track(response.statusCode, contentLength: response.contentLength);
+    } catch (_) {
+      // Silently swallow — tracking failures must never affect the response.
+    }
+
+    return response;
   }
 
   void _track(int statusCode, {int contentLength = -1}) {
-    final endTime = DateTime.now().millisecondsSinceEpoch;
-    final screen  = OrionNetworkTracker.currentScreenName ?? 'UnknownScreen';
-    OrionNetworkTracker.addRequest(screen, {
-      'method':      httpMethod,
-      'url':         trackedUrl,
-      'statusCode':  statusCode,
-      'startTime':   _startTime,
-      'endTime':     endTime,
-      'duration':    endTime - _startTime,
-      'payloadSize': contentLength > 0 ? contentLength : null,
-      'contentType': _inferContentType(trackedUrl),
-    });
+    // ✅ Sampling kill-switch: skip when tracking is globally disabled.
+    if (!SamplingManager.instance.isTrackingEnabled) return;
+
+    try {
+      final endTime = DateTime.now().millisecondsSinceEpoch;
+      final screen  = OrionNetworkTracker.currentScreenName ?? 'UnknownScreen';
+      OrionNetworkTracker.addRequest(screen, {
+        'method':      httpMethod,
+        'url':         trackedUrl,
+        'statusCode':  statusCode,
+        'startTime':   _startTime,
+        'endTime':     endTime,
+        'duration':    endTime - _startTime,
+        'payloadSize': contentLength > 0 ? contentLength : null,
+        'contentType': _inferContentType(trackedUrl),
+      });
+    } catch (_) {}
   }
 
   void _trackError(String error) {
-    final endTime = DateTime.now().millisecondsSinceEpoch;
-    final screen  = OrionNetworkTracker.currentScreenName ?? 'UnknownScreen';
-    OrionNetworkTracker.addRequest(screen, {
-      'method':       httpMethod,
-      'url':          trackedUrl,
-      'statusCode':   -1,
-      'startTime':    _startTime,
-      'endTime':      endTime,
-      'duration':     endTime - _startTime,
-      'errorMessage': error,
-      'contentType':  _inferContentType(trackedUrl),
-    });
+    // ✅ Sampling kill-switch
+    if (!SamplingManager.instance.isTrackingEnabled) return;
+
+    try {
+      final endTime = DateTime.now().millisecondsSinceEpoch;
+      final screen  = OrionNetworkTracker.currentScreenName ?? 'UnknownScreen';
+      OrionNetworkTracker.addRequest(screen, {
+        'method':       httpMethod,
+        'url':          trackedUrl,
+        'statusCode':   -1,
+        'startTime':    _startTime,
+        'endTime':      endTime,
+        'duration':     endTime - _startTime,
+        'errorMessage': error,
+        'contentType':  _inferContentType(trackedUrl),
+      });
+    } catch (_) {}
   }
 
   // Delegate all HttpClientRequest members

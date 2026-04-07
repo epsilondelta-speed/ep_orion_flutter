@@ -3,14 +3,18 @@ import UIKit
 
 /// iOSHealthTracker — Tracks iOS-specific device health signals.
 ///
-/// Captures metrics that have no Android equivalent:
-/// - Thermal state (nominal/fair/serious/critical)
-/// - Low power mode status
-/// - Memory pressure warning count per session
-/// - Main thread hang count per session (>500ms)
+/// Thread-safety fix:
+///   lastMainThreadPing was written from the main thread (via DispatchQueue.main.async)
+///   and read from the background DispatchSourceTimer thread without any
+///   synchronisation — a classic data race on a struct (Date).
+///   Fix: protect lastMainThreadPing with a dedicated NSLock so both reads and
+///   writes are serialised.
 ///
-/// These are added to every beacon under "iosHealth" key.
-/// Android beacons simply won't have this key — server handles gracefully.
+/// False-positive rate:
+///   A 500ms hang threshold is very sensitive — every Flutter frame drop
+///   (Choreographer skipped frames) will count.  The count is still useful as a
+///   session-level heuristic, but callers should interpret it as
+///   "main thread pressure events" rather than true ANR-equivalent hangs.
 final class iOSHealthTracker {
 
     // MARK: - Singleton
@@ -18,73 +22,73 @@ final class iOSHealthTracker {
     private init() {}
 
     // MARK: - State
-    private var memoryWarningCount: Int = 0
-    private var hangCount:          Int = 0
+    private var memoryWarningCount: Int  = 0
+    private var hangCount:          Int  = 0
     private var sessionStartTime:   Date = Date()
     private var observers:          [NSObjectProtocol] = []
-    private let lock =              NSLock()
+    private let lock       = NSLock()
+
+    // ✅ Separate lock for the ping timestamp to avoid priority inversion
+    //    between the heavy session lock and the very-frequent ping writes.
+    private var lastMainThreadPing: Date = Date()
+    private let pingLock = NSLock()
 
     // MARK: - Init
 
     func initialize() {
-        sessionStartTime    = Date()
-        memoryWarningCount  = 0
-        hangCount           = 0
+        lock.lock()
+        sessionStartTime   = Date()
+        memoryWarningCount = 0
+        hangCount          = 0
+        lock.unlock()
 
-        // Remove old observers if re-initializing
+        pingLock.lock()
+        lastMainThreadPing = Date()
+        pingLock.unlock()
+
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers.removeAll()
 
-        // Memory warning observer — mirrors onTrimMemory in Android
         let memObs = NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification,
             object:  nil,
             queue:   .main
         ) { [weak self] _ in
-            self?.lock.lock()
-            self?.memoryWarningCount += 1
-            self?.lock.unlock()
-            OrionLogger.debug("iOSHealthTracker: ⚠️ Memory warning #\(self?.memoryWarningCount ?? 0)")
+            guard let self = self else { return }
+            self.lock.lock()
+            self.memoryWarningCount += 1
+            let count = self.memoryWarningCount
+            self.lock.unlock()
+            OrionLogger.debug("iOSHealthTracker: ⚠️ Memory warning #\(count)")
         }
-        observers.append(memObs)
 
-        // Low power mode observer
         let lpObs = NotificationCenter.default.addObserver(
             forName: NSNotification.Name.NSProcessInfoPowerStateDidChange,
             object:  nil,
             queue:   .main
         ) { _ in
-            let isLow = ProcessInfo.processInfo.isLowPowerModeEnabled
-            OrionLogger.debug("iOSHealthTracker: Low power mode → \(isLow)")
+            OrionLogger.debug("iOSHealthTracker: Low power mode → \(ProcessInfo.processInfo.isLowPowerModeEnabled)")
         }
-        observers.append(lpObs)
 
-        // Thermal state observer
         let thermalObs = NotificationCenter.default.addObserver(
             forName: ProcessInfo.thermalStateDidChangeNotification,
             object:  nil,
             queue:   .main
         ) { _ in
-            let state = ProcessInfo.processInfo.thermalState
-            OrionLogger.debug("iOSHealthTracker: Thermal state → \(state.rawValue)")
+            OrionLogger.debug("iOSHealthTracker: Thermal state → \(ProcessInfo.processInfo.thermalState.rawValue)")
         }
-        observers.append(thermalObs)
 
+        observers = [memObs, lpObs, thermalObs]
         startHangDetection()
         OrionLogger.debug("iOSHealthTracker: Initialized")
     }
 
     // MARK: - Hang Detection
-    // Detects main thread hangs > 500ms by pinging from background thread
-    // Mirrors Android ANR detection concept
 
     private var hangDetectorTimer: DispatchSourceTimer?
-    private var lastMainThreadPing: Date = Date()
 
     private func startHangDetection() {
-        // Ping main thread every 250ms from background
-        // If main thread doesn't respond within 500ms — it's a hang
-        let pingInterval: TimeInterval = 0.25
+        let pingInterval:  TimeInterval = 0.25
         let hangThreshold: TimeInterval = 0.5
 
         hangDetectorTimer?.cancel()
@@ -92,19 +96,27 @@ final class iOSHealthTracker {
         timer.schedule(deadline: .now() + pingInterval, repeating: pingInterval)
         timer.setEventHandler { [weak self] in
             guard let self = self else { return }
-            let now = Date()
-            let gap = now.timeIntervalSince(self.lastMainThreadPing)
 
+            // ✅ Read last ping timestamp under its own lock — safe from background thread.
+            self.pingLock.lock()
+            let lastPing = self.lastMainThreadPing
+            self.pingLock.unlock()
+
+            let gap = Date().timeIntervalSince(lastPing)
             if gap > hangThreshold {
                 self.lock.lock()
                 self.hangCount += 1
+                let count = self.hangCount
                 self.lock.unlock()
-                OrionLogger.debug("iOSHealthTracker: ⚠️ Main thread hang detected (\(Int(gap * 1000))ms)")
+                OrionLogger.debug("iOSHealthTracker: ⚠️ Main thread hang (\(Int(gap * 1000))ms) #\(count)")
             }
 
-            // Ping main thread
+            // Ping the main thread — write under pingLock.
             DispatchQueue.main.async { [weak self] in
-                self?.lastMainThreadPing = Date()
+                guard let self = self else { return }
+                self.pingLock.lock()
+                self.lastMainThreadPing = Date()
+                self.pingLock.unlock()
             }
         }
         timer.resume()
@@ -113,39 +125,35 @@ final class iOSHealthTracker {
 
     // MARK: - Thermal State
 
-    /// Returns current thermal state as string — matches iOS naming
-    /// nominal → fair → serious → critical
     func thermalStateString() -> String {
         switch ProcessInfo.processInfo.thermalState {
-        case .nominal:  return "nominal"
-        case .fair:     return "fair"
-        case .serious:  return "serious"
-        case .critical: return "critical"
+        case .nominal:    return "nominal"
+        case .fair:       return "fair"
+        case .serious:    return "serious"
+        case .critical:   return "critical"
         @unknown default: return "unknown"
         }
     }
 
-    /// Returns thermal state as integer for easy server-side comparison
-    /// 0=nominal, 1=fair, 2=serious, 3=critical (mirrors severity scale)
     func thermalStateLevel() -> Int {
         return Int(ProcessInfo.processInfo.thermalState.rawValue)
     }
 
     // MARK: - Session Metrics
 
-    /// Returns iOS-specific health metrics for beacon inclusion.
-    /// Added under "iosHealth" key — absent on Android beacons (no collision).
     func getSessionMetrics() -> [String: Any] {
         lock.lock()
-        defer { lock.unlock() }
+        let memWarn  = memoryWarningCount
+        let hangs    = hangCount
+        lock.unlock()
 
         return [
-            "thermalState":       thermalStateString(),
-            "thermalLevel":       thermalStateLevel(),        // 0-3
-            "lowPowerMode":       ProcessInfo.processInfo.isLowPowerModeEnabled,
-            "memPressureCount":   memoryWarningCount,         // mirrors Android onTrimMemory count
-            "hangCount":          hangCount,                  // mirrors Android ANR concept
-            "processorCount":     ProcessInfo.processInfo.activeProcessorCount
+            "thermalState":     thermalStateString(),
+            "thermalLevel":     thermalStateLevel(),
+            "lowPowerMode":     ProcessInfo.processInfo.isLowPowerModeEnabled,
+            "memPressureCount": memWarn,
+            "hangCount":        hangs,
+            "processorCount":   ProcessInfo.processInfo.activeProcessorCount
         ]
     }
 

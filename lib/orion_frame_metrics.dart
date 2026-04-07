@@ -2,64 +2,65 @@ import 'dart:ui';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/foundation.dart';
 import 'orion_logger.dart';
+import 'orion_sampling_manager.dart';
 
-/// Ultra-optimized frame metrics tracker with jank cluster detection
+/// Ultra-optimized frame metrics tracker with jank cluster detection.
 ///
-/// Features:
-/// - Tracks all frames with timestamps
-/// - Detects jank clusters (3+ consecutive janky frames)
-/// - Returns top 10 worst clusters
-/// - Frozen frames tracked separately
-/// - Ultra-compact beacon with shorthand names
-/// - ✅ NEW: Epoch timestamps for correlation with network waterfall
+/// Sampling kill-switch: startTracking() is a no-op when
+/// SamplingManager.instance.isTrackingEnabled is false, so no frame callbacks
+/// are registered and no memory is allocated for frame data.
 ///
-/// Shorthand Key:
-/// - sfrm = startFrame
-/// - efrm = endFrame
-/// - st = startTime (ms from navigation start)
-/// - et = endTime (ms from navigation start)
-/// - stEp = startEpoch (absolute epoch ms)  ✅ NEW
-/// - etEp = endEpoch (absolute epoch ms)    ✅ NEW
-/// - avgDur = avgDuration
-/// - worstFrmDur = worstFrameDuration
-/// - jnkCls = jankClusters
-/// - frzFrms = frozenFrames
-/// - totFrm = totalFrames
-/// - jnkFrm = jankyFrames
-/// - frzFrm = frozenFrames
-/// - jnkPct = jankyPercentage
+/// Memory cap: _allFrames is capped at _maxFrames (2 000 entries ≈ 33 s at
+/// 60 fps). Frames beyond the cap are silently dropped so a very long screen
+/// session cannot cause unbounded growth.
 class OrionFrameMetrics {
   static final Map<String, _FrameTracker> _trackers = {};
 
-  /// Start tracking frames for a screen
+  /// Start tracking frames for a screen.
+  /// No-op when the sampling kill-switch is active.
   static void startTracking(String screenName) {
-    if (_trackers.containsKey(screenName)) {
-      orionPrint("⚠️ Already tracking frames for $screenName");
-      return;
+    try {
+      // ✅ Sampling kill-switch: skip frame collection when disabled.
+      if (!SamplingManager.instance.isTrackingEnabled) return;
+
+      if (_trackers.containsKey(screenName)) {
+        orionPrint('⚠️ Already tracking frames for $screenName');
+        return;
+      }
+
+      final tracker = _FrameTracker(screenName);
+      _trackers[screenName] = tracker;
+      tracker.start();
+
+      orionPrint('🎬 Started frame tracking for $screenName');
+    } catch (e) {
+      orionPrint('⚠️ OrionFrameMetrics: startTracking error (ignored): $e');
     }
-
-    final tracker = _FrameTracker(screenName);
-    _trackers[screenName] = tracker;
-    tracker.start();
-
-    orionPrint("🎬 Started frame tracking for $screenName");
   }
 
-  /// Stop tracking and return metrics
+  /// Stop tracking and return metrics. Returns empty result on error.
   static FrameMetricsResult stopTracking(String screenName) {
-    final tracker = _trackers.remove(screenName);
+    try {
+      final tracker = _trackers.remove(screenName);
 
-    if (tracker == null) {
-      orionPrint("⚠️ No tracker found for $screenName");
+      if (tracker == null) {
+        orionPrint('⚠️ No tracker found for $screenName');
+        return FrameMetricsResult.empty();
+      }
+
+      tracker.stop();
+      return tracker.getResults();
+    } catch (e) {
+      orionPrint('⚠️ OrionFrameMetrics: stopTracking error (ignored): $e');
       return FrameMetricsResult.empty();
     }
-
-    tracker.stop();
-    return tracker.getResults();
   }
 }
 
-/// Frame metrics result with ultra-compact beacon format
+// ─────────────────────────────────────────────────────────────────────────────
+// Public result types (unchanged API surface)
+// ─────────────────────────────────────────────────────────────────────────────
+
 class FrameMetricsResult {
   final int jankyFrames;
   final int frozenFrames;
@@ -79,54 +80,45 @@ class FrameMetricsResult {
     required this.frozenFramesList,
   });
 
-  factory FrameMetricsResult.empty() {
-    return FrameMetricsResult(
-      jankyFrames: 0,
-      frozenFrames: 0,
-      totalFrames: 0,
-      avgFrameDuration: 0.0,
-      worstFrameDuration: 0.0,
-      top10Clusters: [],
-      frozenFramesList: [],
-    );
-  }
+  factory FrameMetricsResult.empty() => FrameMetricsResult(
+        jankyFrames: 0,
+        frozenFrames: 0,
+        totalFrames: 0,
+        avgFrameDuration: 0.0,
+        worstFrameDuration: 0.0,
+        top10Clusters: [],
+        frozenFramesList: [],
+      );
 
-  /// Convert to ultra-compact beacon format with shorthand names
   Map<String, dynamic> toBeacon() {
     return {
-      // Summary stats with shorthand
-      'totFrm': totalFrames,           // totalFrames
-      'jnkFrm': jankyFrames,           // jankyFrames
-      'frzFrm': frozenFrames,          // frozenFrames
-      'avgDur': avgFrameDuration.toStringAsFixed(2),       // avgFrameDuration
-      'worstDur': worstFrameDuration.toStringAsFixed(2),   // worstFrameDuration
-      'jnkPct': totalFrames > 0
+      'totFrm':  totalFrames,
+      'jnkFrm':  jankyFrames,
+      'frzFrm':  frozenFrames,
+      'avgDur':  avgFrameDuration.toStringAsFixed(2),
+      'worstDur': worstFrameDuration.toStringAsFixed(2),
+      'jnkPct':  totalFrames > 0
           ? ((jankyFrames / totalFrames) * 100).toStringAsFixed(2)
-          : '0.00',                     // jankyPercentage
-
-      // Top 10 jank clusters (compact)
-      'jnkCls': top10Clusters.map((c) => c.toBeacon()).toList(),
-
-      // Frozen frames separate (if any)
+          : '0.00',
+      'jnkCls':  top10Clusters.map((c) => c.toBeacon()).toList(),
       if (frozenFramesList.isNotEmpty)
         'frzFrms': frozenFramesList.map((f) => f.toBeacon()).toList(),
     };
   }
 }
 
-/// Jank cluster with shorthand names for beacon
 class JankCluster {
   final int id;
-  final int startFrame;          // sfrm in beacon
-  final int endFrame;            // efrm in beacon
-  final int startTime;           // st in beacon (ms from nav start)
-  final int endTime;             // et in beacon (ms from nav start)
-  final int startEpoch;          // stEp in beacon (absolute epoch ms) ✅ NEW
-  final int endEpoch;            // etEp in beacon (absolute epoch ms) ✅ NEW
-  final double avgDuration;      // avgDur in beacon
-  final double worstDuration;    // worstFrmDur in beacon
-  final String buildPhase;       // phase in beacon
-  final double severityScore;    // For sorting, not in beacon
+  final int startFrame;
+  final int endFrame;
+  final int startTime;
+  final int endTime;
+  final int startEpoch;
+  final int endEpoch;
+  final double avgDuration;
+  final double worstDuration;
+  final String buildPhase;
+  final double severityScore;
 
   JankCluster({
     required this.id,
@@ -134,73 +126,62 @@ class JankCluster {
     required this.endFrame,
     required this.startTime,
     required this.endTime,
-    required this.startEpoch,    // ✅ NEW
-    required this.endEpoch,      // ✅ NEW
+    required this.startEpoch,
+    required this.endEpoch,
     required this.avgDuration,
     required this.worstDuration,
     required this.buildPhase,
     required this.severityScore,
   });
 
-  /// Convert to ultra-compact beacon format
-  /// Frontend can calculate:
-  /// - jankyFrameCount = efrm - sfrm + 1
-  /// - severity from avgDur and worstFrmDur
-  /// - duration = et - st
-  ///
-  /// ✅ NEW: stEp/etEp for correlation with network waterfall
-  Map<String, dynamic> toBeacon() {
-    return {
-      'id': id,
-      'sfrm': startFrame,              // startFrame
-      'efrm': endFrame,                // endFrame
-      'st': startTime,                 // startTime (ms from nav)
-      'et': endTime,                   // endTime (ms from nav)
-      'stEp': startEpoch,              // ✅ NEW: startEpoch (absolute ms)
-      'etEp': endEpoch,                // ✅ NEW: endEpoch (absolute ms)
-      'avgDur': avgDuration.toStringAsFixed(2),        // avgDuration
-      'worstFrmDur': worstDuration.toStringAsFixed(2), // worstFrameDuration
-      'phase': buildPhase,             // buildPhase
-    };
-  }
+  Map<String, dynamic> toBeacon() => {
+        'id':          id,
+        'sfrm':        startFrame,
+        'efrm':        endFrame,
+        'st':          startTime,
+        'et':          endTime,
+        'stEp':        startEpoch,
+        'etEp':        endEpoch,
+        'avgDur':      avgDuration.toStringAsFixed(2),
+        'worstFrmDur': worstDuration.toStringAsFixed(2),
+        'phase':       buildPhase,
+      };
 
-  /// Frame count (calculated, not stored)
   int get frameCount => endFrame - startFrame + 1;
 }
 
-/// Frozen frame with shorthand names
 class FrozenFrame {
-  final int frameNumber;      // frm in beacon
-  final int timestamp;        // ts in beacon (ms from nav start)
-  final int epoch;            // ep in beacon (absolute ms) ✅ NEW
-  final double duration;      // dur in beacon
-  final String buildPhase;    // phase in beacon
+  final int frameNumber;
+  final int timestamp;
+  final int epoch;
+  final double duration;
+  final String buildPhase;
 
   FrozenFrame({
     required this.frameNumber,
     required this.timestamp,
-    required this.epoch,       // ✅ NEW
+    required this.epoch,
     required this.duration,
     required this.buildPhase,
   });
 
-  /// Convert to ultra-compact beacon format
-  Map<String, dynamic> toBeacon() {
-    return {
-      'frm': frameNumber,                    // frameNumber
-      'ts': timestamp,                       // timestamp (ms from nav)
-      'ep': epoch,                           // ✅ NEW: epoch (absolute ms)
-      'dur': duration.toStringAsFixed(2),    // duration
-      'phase': buildPhase,                   // buildPhase
-    };
-  }
+  Map<String, dynamic> toBeacon() => {
+        'frm':   frameNumber,
+        'ts':    timestamp,
+        'ep':    epoch,
+        'dur':   duration.toStringAsFixed(2),
+        'phase': buildPhase,
+      };
 }
 
-/// Internal frame timestamp (in-memory only, not in beacon)
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal types
+// ─────────────────────────────────────────────────────────────────────────────
+
 class _FrameTimestamp {
   final int frameNumber;
-  final int timestamp;        // ms from navigation start
-  final int epoch;            // ✅ NEW: absolute epoch ms
+  final int timestamp;
+  final int epoch;
   final double duration;
   final bool isJanky;
   final bool isFrozen;
@@ -209,7 +190,7 @@ class _FrameTimestamp {
   _FrameTimestamp({
     required this.frameNumber,
     required this.timestamp,
-    required this.epoch,       // ✅ NEW
+    required this.epoch,
     required this.duration,
     required this.isJanky,
     required this.isFrozen,
@@ -217,38 +198,32 @@ class _FrameTimestamp {
   });
 }
 
-/// Internal frame tracker
 class _FrameTracker {
   final String screenName;
 
-  // Track all frames in memory (not sent in beacon)
-  final List<_FrameTimestamp> _allFrames = [];
-  final List<FrozenFrame> _frozenFrames = [];
+  final List<_FrameTimestamp> _allFrames   = [];
+  final List<FrozenFrame>     _frozenFrames = [];
 
-  // Timing
+  // ✅ Memory cap: at 60 fps, 2 000 frames ≈ 33 seconds of tracking.
+  // Frames beyond this limit are silently dropped so a long session
+  // never causes unbounded list growth.
+  static const int _maxFrames = 2000;
+
   final Stopwatch _stopwatch = Stopwatch();
   int? _lastFrameTime;
   bool _isTracking = false;
-
-  // ✅ NEW: Track navigation start epoch for absolute timestamps
   late int _navigationStartEpoch;
 
-  // Thresholds (in milliseconds)
-  static const double _jankyThreshold = 16.67;  // >16.67ms = janky
-  static const double _frozenThreshold = 700.0; // >700ms = frozen
+  static const double _jankyThreshold  = 16.67;
+  static const double _frozenThreshold = 700.0;
 
   _FrameTracker(this.screenName);
 
   void start() {
-    _isTracking = true;
-    _lastFrameTime = null;
-
-    // ✅ NEW: Capture navigation start epoch
+    _isTracking           = true;
+    _lastFrameTime        = null;
     _navigationStartEpoch = DateTime.now().millisecondsSinceEpoch;
-
     _stopwatch.start();
-
-    // Register frame callback
     _scheduleNextFrame();
   }
 
@@ -264,240 +239,181 @@ class _FrameTracker {
   }
 
   void _onFrame(Duration timestamp) {
-    if (!_isTracking) return;
+    try {
+      if (!_isTracking) return;
 
-    final currentTime = timestamp.inMilliseconds;
+      final currentTime = timestamp.inMilliseconds;
 
-    if (_lastFrameTime != null) {
-      final frameDuration = (currentTime - _lastFrameTime!).toDouble();
+      if (_lastFrameTime != null) {
+        // ✅ Memory cap: once we hit _maxFrames, stop accumulating frame data.
+        if (_allFrames.length >= _maxFrames) {
+          // Keep scheduling so stop() can be called cleanly, but don't store.
+          _lastFrameTime = currentTime;
+          _scheduleNextFrame();
+          return;
+        }
 
-      // Calculate frame START time (when frame began)
-      final currentStopwatchTime = _stopwatch.elapsedMilliseconds;
-      final frameTimestamp = (currentStopwatchTime - frameDuration.toInt()).clamp(0, currentStopwatchTime);
+        final frameDuration = (currentTime - _lastFrameTime!).toDouble();
+        final currentStopwatchTime = _stopwatch.elapsedMilliseconds;
+        final frameTimestamp = (currentStopwatchTime - frameDuration.toInt())
+            .clamp(0, currentStopwatchTime);
+        final frameEpoch    = _navigationStartEpoch + frameTimestamp;
+        final isJanky       = frameDuration > _jankyThreshold;
+        final isFrozen      = frameDuration > _frozenThreshold;
+        final buildPhase    = _getCurrentBuildPhase();
 
-      // ✅ NEW: Calculate absolute epoch for this frame
-      final frameEpoch = _navigationStartEpoch + frameTimestamp;
-
-      final isJanky = frameDuration > _jankyThreshold;
-      final isFrozen = frameDuration > _frozenThreshold;
-      final buildPhase = _getCurrentBuildPhase();
-
-      // Track frame with timestamp
-      _allFrames.add(_FrameTimestamp(
-        frameNumber: _allFrames.length + 1,
-        timestamp: frameTimestamp,
-        epoch: frameEpoch,             // ✅ NEW
-        duration: frameDuration,
-        isJanky: isJanky,
-        isFrozen: isFrozen,
-        buildPhase: buildPhase,
-      ));
-
-      // Track frozen frames separately
-      if (isFrozen) {
-        _frozenFrames.add(FrozenFrame(
-          frameNumber: _allFrames.length,
-          timestamp: frameTimestamp,
-          epoch: frameEpoch,           // ✅ NEW
-          duration: frameDuration,
-          buildPhase: buildPhase,
+        _allFrames.add(_FrameTimestamp(
+          frameNumber: _allFrames.length + 1,
+          timestamp:   frameTimestamp,
+          epoch:       frameEpoch,
+          duration:    frameDuration,
+          isJanky:     isJanky,
+          isFrozen:    isFrozen,
+          buildPhase:  buildPhase,
         ));
+
+        if (isFrozen) {
+          _frozenFrames.add(FrozenFrame(
+            frameNumber: _allFrames.length,
+            timestamp:   frameTimestamp,
+            epoch:       frameEpoch,
+            duration:    frameDuration,
+            buildPhase:  buildPhase,
+          ));
+        }
       }
+
+      _lastFrameTime = currentTime;
+      _scheduleNextFrame();
+    } catch (e) {
+      // Never let frame callback errors propagate to the Flutter scheduler.
+      _isTracking = false;
     }
-
-    _lastFrameTime = currentTime;
-
-    // Schedule next frame
-    _scheduleNextFrame();
   }
 
   String _getCurrentBuildPhase() {
-    final phase = SchedulerBinding.instance.schedulerPhase;
-
-    switch (phase) {
-      case SchedulerPhase.idle:
-        return 'idle';
-      case SchedulerPhase.transientCallbacks:
-        return 'animation';
-      case SchedulerPhase.midFrameMicrotasks:
-        return 'microtasks';
-      case SchedulerPhase.persistentCallbacks:
-        return 'build';
-      case SchedulerPhase.postFrameCallbacks:
-        return 'postFrame';
-      default:
-        return 'unknown';
+    try {
+      final phase = SchedulerBinding.instance.schedulerPhase;
+      switch (phase) {
+        case SchedulerPhase.idle:               return 'idle';
+        case SchedulerPhase.transientCallbacks:  return 'animation';
+        case SchedulerPhase.midFrameMicrotasks:  return 'microtasks';
+        case SchedulerPhase.persistentCallbacks: return 'build';
+        case SchedulerPhase.postFrameCallbacks:  return 'postFrame';
+        default:                                 return 'unknown';
+      }
+    } catch (_) {
+      return 'unknown';
     }
   }
 
   FrameMetricsResult getResults() {
-    // Calculate summary stats
-    final jankyFrames = _allFrames.where((f) => f.isJanky).length;
-    final frozenFramesCount = _frozenFrames.length;
-    final totalFrames = _allFrames.length;
+    try {
+      final jankyFrames      = _allFrames.where((f) => f.isJanky).length;
+      final frozenFramesCount = _frozenFrames.length;
+      final totalFrames      = _allFrames.length;
 
-    final avgDuration = _allFrames.isEmpty
-        ? 0.0
-        : _allFrames.map((f) => f.duration).reduce((a, b) => a + b) / _allFrames.length;
+      final avgDuration = _allFrames.isEmpty
+          ? 0.0
+          : _allFrames.map((f) => f.duration).reduce((a, b) => a + b) /
+              _allFrames.length;
 
-    final worstDuration = _allFrames.isEmpty
-        ? 0.0
-        : _allFrames.map((f) => f.duration).reduce((a, b) => a > b ? a : b);
+      final worstDuration = _allFrames.isEmpty
+          ? 0.0
+          : _allFrames.map((f) => f.duration).reduce((a, b) => a > b ? a : b);
 
-    // Detect jank clusters
-    final allClusters = _detectJankClusters();
+      final allClusters  = _detectJankClusters();
+      final top10Clusters = _selectTop10Clusters(allClusters);
 
-    // Select top 10 worst clusters
-    final top10Clusters = _selectTop10Clusters(allClusters);
-
-    // Log summary
-    orionPrint(
-        "📊 [$screenName] Frame Metrics:\n"
-            "   Total: $totalFrames frames\n"
-            "   Janky: $jankyFrames (${_getPercentage(jankyFrames, totalFrames)}%)\n"
-            "   Frozen: $frozenFramesCount\n"
-            "   Avg: ${avgDuration.toStringAsFixed(2)}ms\n"
-            "   Worst: ${worstDuration.toStringAsFixed(2)}ms\n"
-            "   Clusters detected: ${allClusters.length}\n"
-            "   Top 10 clusters: ${top10Clusters.length}"
-    );
-
-    // Log top 3 clusters
-    if (top10Clusters.isNotEmpty) {
-      orionPrint("🐌 Top jank clusters for $screenName:");
-      for (var i = 0; i < top10Clusters.length && i < 3; i++) {
-        final cluster = top10Clusters[i];
+      if (kDebugMode) {
         orionPrint(
-            "   Cluster #${cluster.id}: Frames ${cluster.startFrame}-${cluster.endFrame} "
-                "(${cluster.startTime}-${cluster.endTime}ms) - "
-                "Worst: ${cluster.worstDuration.toStringAsFixed(2)}ms"
+          '📊 [$screenName] Frames: $totalFrames total, $jankyFrames janky, '
+          '$frozenFramesCount frozen, avg=${avgDuration.toStringAsFixed(2)}ms',
         );
       }
-    }
 
-    return FrameMetricsResult(
-      jankyFrames: jankyFrames,
-      frozenFrames: frozenFramesCount,
-      totalFrames: totalFrames,
-      avgFrameDuration: avgDuration,
-      worstFrameDuration: worstDuration,
-      top10Clusters: top10Clusters,
-      frozenFramesList: _frozenFrames,
-    );
+      return FrameMetricsResult(
+        jankyFrames:       jankyFrames,
+        frozenFrames:      frozenFramesCount,
+        totalFrames:       totalFrames,
+        avgFrameDuration:  avgDuration,
+        worstFrameDuration: worstDuration,
+        top10Clusters:     top10Clusters,
+        frozenFramesList:  _frozenFrames,
+      );
+    } catch (e) {
+      orionPrint('⚠️ OrionFrameMetrics: getResults error: $e');
+      return FrameMetricsResult.empty();
+    }
   }
 
-  /// Detect jank clusters (3+ consecutive janky frames)
   List<JankCluster> _detectJankClusters() {
-    final clusters = <JankCluster>[];
+    final clusters       = <JankCluster>[];
     List<_FrameTimestamp> currentCluster = [];
-    int clusterId = 1;
+    int clusterId        = 1;
 
-    for (var i = 0; i < _allFrames.length; i++) {
-      final frame = _allFrames[i];
-
+    for (final frame in _allFrames) {
       if (frame.isJanky) {
-        // Add to current cluster
         currentCluster.add(frame);
       } else {
-        // End of cluster - check if valid (3+ frames)
         if (currentCluster.length >= 3) {
           clusters.add(_createCluster(currentCluster, clusterId++));
         }
         currentCluster = [];
       }
     }
-
-    // Check last cluster
     if (currentCluster.length >= 3) {
       clusters.add(_createCluster(currentCluster, clusterId));
     }
-
     return clusters;
   }
 
-  /// Create cluster from frame list
   JankCluster _createCluster(List<_FrameTimestamp> frames, int id) {
-    final startFrame = frames.first.frameNumber;
-    final endFrame = frames.last.frameNumber;
-    final startTime = frames.first.timestamp;
-    final endTime = frames.last.timestamp + frames.last.duration.toInt();
-
-    // ✅ NEW: Calculate epoch timestamps for cluster
-    final startEpoch = frames.first.epoch;
-    final endEpoch = frames.last.epoch + frames.last.duration.toInt();
-
-    final avgDuration = frames.map((f) => f.duration).reduce((a, b) => a + b) / frames.length;
+    final avgDuration   = frames.map((f) => f.duration).reduce((a, b) => a + b) / frames.length;
     final worstDuration = frames.map((f) => f.duration).reduce((a, b) => a > b ? a : b);
-
-    // Get most common build phase
-    final phases = frames.map((f) => f.buildPhase).toList();
-    final buildPhase = _getMostCommon(phases);
-
-    // Calculate severity score for sorting
-    final severityScore = _calculateSeverityScore(
-      startFrame: startFrame,
-      frameCount: frames.length,
-      avgDuration: avgDuration,
-      worstDuration: worstDuration,
-    );
+    final phases        = frames.map((f) => f.buildPhase).toList();
 
     return JankCluster(
-      id: id,
-      startFrame: startFrame,
-      endFrame: endFrame,
-      startTime: startTime,
-      endTime: endTime,
-      startEpoch: startEpoch,    // ✅ NEW
-      endEpoch: endEpoch,        // ✅ NEW
-      avgDuration: avgDuration,
+      id:            id,
+      startFrame:    frames.first.frameNumber,
+      endFrame:      frames.last.frameNumber,
+      startTime:     frames.first.timestamp,
+      endTime:       frames.last.timestamp + frames.last.duration.toInt(),
+      startEpoch:    frames.first.epoch,
+      endEpoch:      frames.last.epoch + frames.last.duration.toInt(),
+      avgDuration:   avgDuration,
       worstDuration: worstDuration,
-      buildPhase: buildPhase,
-      severityScore: severityScore,
+      buildPhase:    _getMostCommon(phases),
+      severityScore: _calculateSeverityScore(
+        startFrame:    frames.first.frameNumber,
+        frameCount:    frames.length,
+        avgDuration:   avgDuration,
+        worstDuration: worstDuration,
+      ),
     );
   }
 
-  /// Calculate severity score for cluster prioritization
-  /// Higher score = worse cluster = higher priority
   double _calculateSeverityScore({
     required int startFrame,
     required int frameCount,
     required double avgDuration,
     required double worstDuration,
   }) {
-    // Formula: (avgDur × 0.3) + (worstDur × 0.4) + (frameCount × 5) + (early bonus)
-
-    final avgWeight = avgDuration * 0.3;
-    final worstWeight = worstDuration * 0.4;
-    final countWeight = frameCount * 5.0;
-
-    // Early clusters (first 10 frames) get bonus - critical for UX
     final earlyBonus = startFrame <= 10 ? 20.0 : 0.0;
-
-    return avgWeight + worstWeight + countWeight + earlyBonus;
+    return (avgDuration * 0.3) + (worstDuration * 0.4) + (frameCount * 5.0) + earlyBonus;
   }
 
-  /// Select top 10 worst clusters by severity score
-  List<JankCluster> _selectTop10Clusters(List<JankCluster> allClusters) {
-    // Sort by severity score (worst first)
-    allClusters.sort((a, b) => b.severityScore.compareTo(a.severityScore));
-
-    // Take top 10
-    return allClusters.take(10).toList();
+  List<JankCluster> _selectTop10Clusters(List<JankCluster> all) {
+    all.sort((a, b) => b.severityScore.compareTo(a.severityScore));
+    return all.take(10).toList();
   }
 
   String _getMostCommon(List<String> items) {
     if (items.isEmpty) return 'unknown';
-
     final counts = <String, int>{};
-    for (var item in items) {
+    for (final item in items) {
       counts[item] = (counts[item] ?? 0) + 1;
     }
-
     return counts.entries.reduce((a, b) => a.value > b.value ? a : b).key;
-  }
-
-  String _getPercentage(int part, int total) {
-    if (total == 0) return '0.0';
-    return ((part / total) * 100).toStringAsFixed(1);
   }
 }

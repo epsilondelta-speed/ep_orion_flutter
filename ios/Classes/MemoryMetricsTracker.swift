@@ -2,6 +2,17 @@ import Foundation
 
 /// MemoryMetricsTracker — Session-level memory growth tracking.
 /// Mirrors MemoryMetricsTracker.kt exactly.
+///
+/// Thread-safety fix: all mutable state is now guarded by NSLock.
+/// Previously startNewSession(), onScreenTransition(), and getSessionMetrics()
+/// read/wrote shared vars (peakBytes, currentBytes, samples, etc.) without any
+/// synchronization.  onScreenTransition() is called from FlutterSendData
+/// (platform thread) while getSessionMetrics() can be called concurrently
+/// from the same path — a data race.
+///
+/// Sampling kill-switch: onScreenTransition() returns early when
+/// iOSSamplingManager.shared.isTrackingEnabled is false, saving CPU when the
+/// remote kill-switch is active.
 final class MemoryMetricsTracker {
 
     // MARK: - Singleton
@@ -9,26 +20,38 @@ final class MemoryMetricsTracker {
     private init() {}
 
     // MARK: - Constants
-    private let tag = "MemoryMetrics"
-    private let minDurationMs: Double = 36_000  // 36 sec minimum for growth rate
+    private let tag            = "MemoryMetrics"
+    private let minDurationMs: Double = 36_000
+    private let sessionTimeoutMs: Double = 30 * 60 * 1000
+    private let maxSamples     = 100
 
-    // MARK: - Session state
+    // MARK: - Session state (guarded by lock)
     private var startBytes:   Int64  = -1
     private var startTime:    Double = 0
     private var peakBytes:    Int64  = 0
     private var currentBytes: Int64  = 0
     private var samples:      Int    = 0
     private var active:       Bool   = false
+    private let lock = NSLock()
 
     // MARK: - Init
 
     func initialize() {
+        lock.lock()
+        defer { lock.unlock() }
         guard !active else { return }
-        startNewSession()
+        startNewSessionLocked()
         OrionLogger.debug("\(tag): Initialized")
     }
 
     func startNewSession() {
+        lock.lock()
+        defer { lock.unlock() }
+        startNewSessionLocked()
+    }
+
+    // Must be called while lock is held.
+    private func startNewSessionLocked() {
         let bytes    = residentMemoryBytes()
         startBytes   = bytes
         startTime    = nowMs()
@@ -42,7 +65,34 @@ final class MemoryMetricsTracker {
     // MARK: - Sample on screen transition
 
     func onScreenTransition() {
-        guard active else { startNewSession(); return }
+        // ✅ Sampling kill-switch: skip native memory sampling when disabled.
+        if !iOSSamplingManager.shared.isTrackingEnabled {
+            return
+        }
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        if !active {
+            startNewSessionLocked()
+            return
+        }
+
+        // Auto-reset after 30 minutes (mirrors Android SESSION_TIMEOUT_MS).
+        let sessionDuration = nowMs() - startTime
+        if sessionDuration > sessionTimeoutMs {
+            OrionLogger.debug("\(tag): Session timeout, resetting")
+            startNewSessionLocked()
+            return
+        }
+
+        // Auto-reset after 100 samples (mirrors Android MAX_SAMPLES).
+        if samples >= maxSamples {
+            OrionLogger.debug("\(tag): Max samples reached, resetting")
+            startNewSessionLocked()
+            return
+        }
+
         let bytes = residentMemoryBytes()
         currentBytes = bytes
         if bytes > peakBytes { peakBytes = bytes }
@@ -52,7 +102,8 @@ final class MemoryMetricsTracker {
     // MARK: - Session Metrics
 
     func getSessionMetrics() -> [String: Any] {
-        if !active { startNewSession() }
+        lock.lock()
+        if !active { startNewSessionLocked() }
 
         let bytes = residentMemoryBytes()
         currentBytes = bytes
@@ -69,7 +120,7 @@ final class MemoryMetricsTracker {
             ? growthMB / hours
             : 0.0
 
-        return [
+        let result: [String: Any] = [
             "startMB":       round2(startMB),
             "curMB":         round2(curMB),
             "peakMB":        round2(peakMB),
@@ -77,9 +128,13 @@ final class MemoryMetricsTracker {
             "growthPerHour": round2(growthPerHour),
             "samples":       samples
         ]
+        lock.unlock()
+        return result
     }
 
     func resetSession() {
+        lock.lock()
+        defer { lock.unlock() }
         startBytes   = -1
         startTime    = 0
         peakBytes    = 0
@@ -89,11 +144,16 @@ final class MemoryMetricsTracker {
         OrionLogger.debug("\(tag): Session reset")
     }
 
-    func isSessionActive() -> Bool { return active }
-    func getCurrentMemoryMB() -> Double { return toMB(residentMemoryBytes()) }
+    func isSessionActive() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return active
+    }
+
+    func getCurrentMemoryMB() -> Double {
+        return toMB(residentMemoryBytes())
+    }
 
     // MARK: - iOS Memory API
-    // mach_task_basic_info.resident_size = physical RAM used by this process
 
     private func residentMemoryBytes() -> Int64 {
         var info  = mach_task_basic_info()
@@ -117,7 +177,6 @@ final class MemoryMetricsTracker {
         return bytes > 0 ? String(format: "%.1f MB", toMB(bytes)) : "N/A"
     }
 
-    // ✅ Fixed round2 — no more 153.05000000000001 floating point ugliness
     private func round2(_ v: Double) -> Double {
         guard v >= 0 else { return v }
         return (v * 100).rounded() / 100

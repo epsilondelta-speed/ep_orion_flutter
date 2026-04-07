@@ -3,6 +3,18 @@ import UIKit
 
 /// WakeLockTracker — Full iOS implementation.
 /// Mirrors WakeLockTracker.kt exactly.
+///
+/// Thread-safety fix:
+///   UIApplication.shared.beginBackgroundTask / endBackgroundTask MUST be
+///   called on the main thread.  Previously acquire() was called from the
+///   Flutter method channel (platform thread, not main thread) — a threading
+///   violation that can crash under certain iOS conditions.
+///   Fix: dispatch the UIApplication calls to the main thread while still
+///   returning control to the caller synchronously via a semaphore.
+///
+/// Sampling kill-switch:
+///   trackAcquire() / trackRelease() return early when
+///   iOSSamplingManager.shared.isTrackingEnabled is false.
 final class WakeLockTracker {
 
     // MARK: - Singleton
@@ -68,7 +80,7 @@ final class WakeLockTracker {
                     metrics.backgroundMs += bgDuration
                     sessionMetricsMap[tag] = metrics
                 }
-                totalBgTimeMs += bgDuration
+                totalBgTimeMs     += bgDuration
                 info.bgStartTimeMs = nil
                 activeWakeLocks[tag] = info
             }
@@ -83,7 +95,7 @@ final class WakeLockTracker {
         let now = nowMs()
         for (tag, var info) in activeWakeLocks {
             if info.bgStartTimeMs == nil {
-                info.bgStartTimeMs = now
+                info.bgStartTimeMs   = now
                 activeWakeLocks[tag] = info
             }
         }
@@ -103,12 +115,19 @@ final class WakeLockTracker {
             return true
         }
 
-        // Use a class-based box so the expiry closure can reference
-        // the task ID without Swift's "mutated after capture" error
+        // ✅ UIApplication.shared.beginBackgroundTask must run on main thread.
+        //    We dispatch to main and wait synchronously so the caller gets the
+        //    task ID before we store the ActiveWakeLockInfo.
         let box = TaskBox()
-        box.id = UIApplication.shared.beginBackgroundTask(withName: tag) {
-            UIApplication.shared.endBackgroundTask(box.id)
-            box.id = UIBackgroundTaskIdentifier.invalid
+        if Thread.isMainThread {
+            box.id = startBackgroundTask(tag: tag, box: box)
+        } else {
+            let sema = DispatchSemaphore(value: 0)
+            DispatchQueue.main.async {
+                box.id = self.startBackgroundTask(tag: tag, box: box)
+                sema.signal()
+            }
+            sema.wait()
         }
 
         let now = nowMs()
@@ -142,20 +161,36 @@ final class WakeLockTracker {
         return box.id != UIBackgroundTaskIdentifier.invalid
     }
 
+    // Must be called on the main thread.
+    private func startBackgroundTask(tag: String, box: TaskBox) -> UIBackgroundTaskIdentifier {
+        return UIApplication.shared.beginBackgroundTask(withName: tag) {
+            // ✅ endBackgroundTask also main-thread-only; expiry handler runs on main.
+            UIApplication.shared.endBackgroundTask(box.id)
+            box.id = UIBackgroundTaskIdentifier.invalid
+        }
+    }
+
     // MARK: - Release
 
     func release(tag: String) {
         lock.lock()
-        defer { lock.unlock() }
-
         guard let info = activeWakeLocks.removeValue(forKey: tag) else {
+            lock.unlock()
             OrionLogger.debug("WakeLockTracker: release called for unknown '\(tag)'")
             return
         }
+        let bgTaskId = info.bgTaskId
+        lock.unlock()
 
-        if info.bgTaskId != UIBackgroundTaskIdentifier.invalid {
-            UIApplication.shared.endBackgroundTask(info.bgTaskId)
+        // ✅ endBackgroundTask must run on the main thread.
+        if bgTaskId != UIBackgroundTaskIdentifier.invalid {
+            DispatchQueue.main.async {
+                UIApplication.shared.endBackgroundTask(bgTaskId)
+            }
         }
+
+        lock.lock()
+        defer { lock.unlock() }
 
         let now          = nowMs()
         let heldMs       = now - info.acquireTimeMs
@@ -179,9 +214,12 @@ final class WakeLockTracker {
         OrionLogger.debug("WakeLockTracker: released '\(tag)' after \(Int(heldMs))ms\(isStuck ? " STUCK" : "")")
     }
 
-    // MARK: - Manual Tracking
+    // MARK: - Manual Tracking (sampling-gated)
 
     func trackAcquire(tag: String, timeoutMs: Int? = nil) {
+        // ✅ Sampling kill-switch
+        guard iOSSamplingManager.shared.isTrackingEnabled else { return }
+
         lock.lock()
         defer { lock.unlock() }
         guard activeWakeLocks[tag] == nil else { return }
@@ -208,7 +246,11 @@ final class WakeLockTracker {
         OrionLogger.debug("WakeLockTracker: manual acquire '\(tag)'")
     }
 
-    func trackRelease(tag: String) { release(tag: tag) }
+    func trackRelease(tag: String) {
+        // ✅ Sampling kill-switch
+        guard iOSSamplingManager.shared.isTrackingEnabled else { return }
+        release(tag: tag)
+    }
 
     // MARK: - Query
 
@@ -294,8 +336,6 @@ final class WakeLockTracker {
 }
 
 // MARK: - TaskBox
-// Class wrapper so the background task expiry closure can mutate
-// the task ID safely — avoids Swift "mutated after capture" compile error
 private final class TaskBox {
     var id: UIBackgroundTaskIdentifier = .invalid
 }

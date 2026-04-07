@@ -4,6 +4,22 @@ import CryptoKit
 
 /// AppMetrics — Collects static device info and runtime metrics.
 /// Mirrors AppRuntimeMetrics.kt + adds iOS-specific health fields.
+///
+/// Fixes applied:
+///
+/// 1. Duplicate iosHealth removed from getAppMetrics().
+///    FlutterSendData.sendFlutterScreenMetrics() already sets
+///    beacon["iosHealth"] before merging staticMetrics, and the merge uses
+///    `if beacon[key] == nil` so the duplicate from AppMetrics was discarded
+///    anyway.  Calling iOSHealthTracker.shared.getSessionMetrics() twice per
+///    beacon (once in FlutterSendData, once in AppMetrics) wastes CPU.
+///    AppMetrics.getAppMetrics() no longer includes iosHealth; FlutterSendData
+///    remains the single injection point.
+///
+/// 2. batteryPercent() — UIDevice.current.batteryLevel must be called on the
+///    main thread.  getRuntimeMetrics() is called from FlutterSendData (platform
+///    thread).  batteryPercent() now returns the value cached by
+///    BatteryMetricsTracker, which updates via main-thread notifications.
 final class AppMetrics {
 
     // MARK: - Singleton
@@ -64,10 +80,12 @@ final class AppMetrics {
             "isDeviceRooted":   isDeviceJailbroken(),
 
             // Session identity
-            "userSessionId":    hashedDeviceId(),
+            "userSessionId":    hashedDeviceId()
 
-            // ✅ iOS-specific health — absent on Android beacons (no collision)
-            "iosHealth":        iOSHealthTracker.shared.getSessionMetrics()
+            // ✅ iosHealth REMOVED from here.
+            //    FlutterSendData is the single injection point (one call per beacon).
+            //    AppMetrics.getAppMetrics() is merged with `if beacon[key] == nil`
+            //    so a duplicate here would be silently discarded anyway.
         ]
 
         // Runtime metrics
@@ -78,7 +96,7 @@ final class AppMetrics {
         return metrics
     }
 
-    // MARK: - Runtime Metrics (changes over time)
+    // MARK: - Runtime Metrics
 
     func getRuntimeMetrics() -> [String: Any] {
         return [
@@ -150,7 +168,7 @@ final class AppMetrics {
         #endif
     }
 
-    // MARK: - Memory % (device RAM via mach_task_basic_info)
+    // MARK: - Memory % (device RAM — safe from any thread)
 
     private func memoryUsagePercent() -> Int {
         let total = ProcessInfo.processInfo.physicalMemory
@@ -166,15 +184,17 @@ final class AppMetrics {
         return Int((UInt64(info.resident_size) * 100) / total)
     }
 
-    // MARK: - Battery %
+    // MARK: - Battery % (thread-safe)
 
     private func batteryPercent() -> Int {
-        UIDevice.current.isBatteryMonitoringEnabled = true
-        let level = UIDevice.current.batteryLevel
-        return level < 0 ? -1 : Int(level * 100)
+        // ✅ UIDevice.current.batteryLevel must be read on the main thread.
+        //    BatteryMetricsTracker caches the value via UIDevice battery change
+        //    notifications (which fire on the main thread) so the cached value
+        //    is safe to read here from any thread.
+        return BatteryMetricsTracker.shared.getSessionMetrics()["sessionBatteryCurrent"] as? Int ?? -1
     }
 
-    // MARK: - Disk %
+    // MARK: - Disk % (safe from any thread)
 
     private func diskUsagePercent() -> Int {
         guard
