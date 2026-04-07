@@ -42,6 +42,11 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
     private var currentScreen:  String?
     private var batterySessionStarted = false
 
+    // Stored as a static so the NSSetUncaughtExceptionHandler closure can
+    // reference it without capturing `self` or any local variable — C function
+    // pointers cannot capture context from the enclosing Swift scope.
+    private static var previousUncaughtExceptionHandler: (@convention(c) (NSException) -> Void)? = nil
+
     // MARK: - Method Channel Handler
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -104,7 +109,12 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
             // ✅ Chain the crash handler rather than overwriting it.
             //    Libraries like Crashlytics / Sentry install their own handler first.
             //    Overwriting without chaining silently breaks their crash reporting.
-            let previousHandler = NSGetUncaughtExceptionHandler()
+            //
+            //    NSSetUncaughtExceptionHandler requires a plain C function pointer,
+            //    which cannot capture context from the enclosing Swift scope.
+            //    We store the previous handler in a static variable so the closure
+            //    is context-free and satisfies the C function pointer requirement.
+            OrionFlutterPlugin.previousUncaughtExceptionHandler = NSGetUncaughtExceptionHandler()
             NSSetUncaughtExceptionHandler { exception in
                 // Build and send Orion crash beacon.
                 var beacon: [String: Any] = [
@@ -128,8 +138,8 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
                 SendData().coronaGo(beacon)
                 Thread.sleep(forTimeInterval: 0.5)
 
-                // ✅ Forward to the previously installed handler.
-                previousHandler?(exception)
+                // ✅ Forward to the previously installed handler (Crashlytics, Sentry, etc.)
+                OrionFlutterPlugin.previousUncaughtExceptionHandler?(exception)
             }
 
             isInitialized = true
