@@ -3,6 +3,19 @@
 /// Sampling kill-switch: _trackRequest() returns immediately when
 /// SamplingManager.instance.isTrackingEnabled is false so no data is
 /// collected when the remote kill-switch is active.
+///
+/// Payload size fix (Fix #12): _getPayloadSize previously called .toString()
+/// on Map and List response bodies just to measure their stringified length.
+/// For a large response Map this could allocate megabytes of String data per
+/// request — only to throw it away. We now return null for structured data
+/// (size estimate isn't worth the GC pressure) and only measure when the
+/// length is cheap to obtain (List<int>, String).
+///
+/// Sampling-aware logging (Fix #13): onRequest already short-circuits when
+/// sampling is disabled. Previously onResponse and onError still entered
+/// _trackRequest, which checked sampling and bailed — but only after logging
+/// "Missing startTime" because onRequest had skipped setting it. Now we check
+/// sampling at the entry of onResponse and onError too, eliminating the spam.
 
 import 'dart:io';
 import 'package:dio/dio.dart';
@@ -36,22 +49,28 @@ class OrionDioInterceptor extends Interceptor {
   @override
   void onResponse(Response response, ResponseInterceptorHandler handler) {
     try {
-      if (OrionFlutter.isSupported) {
-        final processingTimeStr = response.headers['x-response-time']?.first;
-        final processingTime    = int.tryParse(processingTimeStr ?? '') ?? 0;
+      // ✅ Fix #13: short-circuit at the entry point when sampling is off.
+      //    Previously we entered _trackRequest which would log "Missing startTime"
+      //    on every response because onRequest had skipped setting it.
+      if (!OrionFlutter.isSupported ||
+          !SamplingManager.instance.isTrackingEnabled) {
+        return;
+      }
 
-        _trackRequest(
-          response.requestOptions,
-          response.statusCode ?? -1,
-          payload:     response.data,
-          contentType: response.headers[HttpHeaders.contentTypeHeader]?.first,
-          actualTime:  processingTime,
-        );
+      final processingTimeStr = response.headers['x-response-time']?.first;
+      final processingTime    = int.tryParse(processingTimeStr ?? '') ?? 0;
 
-        if (verbose) {
-          orionPrint('✅ [Orion] Response: ${response.statusCode} '
-              '${response.requestOptions.uri}');
-        }
+      _trackRequest(
+        response.requestOptions,
+        response.statusCode ?? -1,
+        payload:     response.data,
+        contentType: response.headers[HttpHeaders.contentTypeHeader]?.first,
+        actualTime:  processingTime,
+      );
+
+      if (verbose) {
+        orionPrint('✅ [Orion] Response: ${response.statusCode} '
+            '${response.requestOptions.uri}');
       }
     } catch (e) {
       orionPrint('⚠️ [Orion] onResponse tracking error (ignored): $e');
@@ -63,20 +82,24 @@ class OrionDioInterceptor extends Interceptor {
   @override
   void onError(DioException err, ErrorInterceptorHandler handler) {
     try {
-      if (OrionFlutter.isSupported) {
-        final statusCode = err.response?.statusCode ?? -1;
-        orionPrint('🔴 [Orion] Error: [${err.requestOptions.method}] '
-            '${err.requestOptions.uri} | Status: $statusCode | '
-            '${err.type.name}: ${err.message}');
-
-        _trackRequest(
-          err.requestOptions,
-          statusCode,
-          error:       _formatErrorMessage(err),
-          contentType: err.response?.headers[HttpHeaders.contentTypeHeader]?.first,
-          actualTime:  0,
-        );
+      // ✅ Fix #13: short-circuit at the entry point when sampling is off.
+      if (!OrionFlutter.isSupported ||
+          !SamplingManager.instance.isTrackingEnabled) {
+        return;
       }
+
+      final statusCode = err.response?.statusCode ?? -1;
+      orionPrint('🔴 [Orion] Error: [${err.requestOptions.method}] '
+          '${err.requestOptions.uri} | Status: $statusCode | '
+          '${err.type.name}: ${err.message}');
+
+      _trackRequest(
+        err.requestOptions,
+        statusCode,
+        error:       _formatErrorMessage(err),
+        contentType: err.response?.headers[HttpHeaders.contentTypeHeader]?.first,
+        actualTime:  0,
+      );
     } catch (e) {
       orionPrint('⚠️ [Orion] onError tracking error (ignored): $e');
     } finally {
@@ -118,15 +141,16 @@ class OrionDioInterceptor extends Interceptor {
   }
 
   void _trackRequest(
-    RequestOptions options,
-    int statusCode, {
-    String? error,
-    dynamic payload,
-    String? contentType,
-    int actualTime = 0,
-  }) {
+      RequestOptions options,
+      int statusCode, {
+        String? error,
+        dynamic payload,
+        String? contentType,
+        int actualTime = 0,
+      }) {
     try {
-      // ✅ Sampling kill-switch: skip collection when tracking is disabled.
+      // Sampling check is also performed at the entry of onResponse/onError,
+      // but kept here too so any future caller is safe.
       if (!SamplingManager.instance.isTrackingEnabled) return;
 
       final startTime = options.extra['startTime'] as int?;
@@ -160,15 +184,29 @@ class OrionDioInterceptor extends Interceptor {
     }
   }
 
+  /// Estimate payload size for the response.
+  ///
+  /// Cheap measurements only:
+  ///   - List<int>: byte count, free
+  ///   - String:    char count, free
+  ///   - Map/List:  null — see below
+  ///
+  /// Why not Map/List: previously this called .toString() on structured data,
+  /// then took its length. For a large response Map this allocates megabytes
+  /// of String data on every response just to measure it. The size estimate
+  /// isn't worth that GC churn — most callers only care about transport-level
+  /// payload size (which Dio tells us via Content-Length header in the
+  /// Dio interceptor's response, but which we don't currently plumb here).
+  /// Returning null is honest: we don't know cheaply.
   int? _getPayloadSize(dynamic data) {
     if (data == null) return null;
     try {
       if (data is List<int>) return data.length;
       if (data is String)    return data.length;
-      if (data is Map || data is List) {
-        final str = data.toString();
-        return str.length > 100000 ? 100000 : str.length;
-      }
+      // ✅ Fix #12: previously did `data.toString().length` for Map/List which
+      //    allocated the full stringified body just to measure it. Now return
+      //    null — we don't know payload size cheaply for structured data.
+      return null;
     } catch (e) {
       orionPrint('⚠️ [Orion] Error calculating payload size (ignored): $e');
     }

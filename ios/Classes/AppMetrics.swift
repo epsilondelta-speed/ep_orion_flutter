@@ -20,6 +20,14 @@ import CryptoKit
 ///    main thread.  getRuntimeMetrics() is called from FlutterSendData (platform
 ///    thread).  batteryPercent() now returns the value cached by
 ///    BatteryMetricsTracker, which updates via main-thread notifications.
+///
+/// 3. sdkReleaseName (Fix iOS-1): no longer hardcoded to "1.0.8".  This caused
+///    beacon["releaseName"] and beacon["libVer"] to disagree — releaseName
+///    came from this stale string while libVer came from OrionConfig.sdkVersion
+///    (bundle lookup). Both fields are meant to report the SDK version, so
+///    they must agree. We now compute the default from the same bundle source
+///    used by OrionConfig.sdkVersion. Kept as `var` so test code or future
+///    overrides can still mutate it.
 final class AppMetrics {
 
     // MARK: - Singleton
@@ -27,10 +35,17 @@ final class AppMetrics {
     private init() {}
 
     // MARK: - Config
-    var companyId:      String = ""
-    var projectId:      String = ""
-    var appVersion:     String = ""
-    var sdkReleaseName: String = "1.0.8"
+
+    var companyId:  String = ""
+    var projectId:  String = ""
+    var appVersion: String = ""
+
+    /// SDK release version reported in `releaseName` field.
+    ///
+    /// Default value is derived from the SDK bundle's CFBundleShortVersionString
+    /// (same source as OrionConfig.sdkVersion / `libVer`) so the two fields
+    /// stay in sync. Mutable so tests / future overrides can replace it.
+    var sdkReleaseName: String = OrionConfig.sdkVersion
 
     private var iOSVersion: Int {
         return Int(UIDevice.current.systemVersion.split(separator: ".").first ?? "16") ?? 16
