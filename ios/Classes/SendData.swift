@@ -3,22 +3,35 @@ import Network
 
 /// SendData — Sends beacon JSON to the Orion backend.
 ///
-/// Fixes applied:
+/// V2 changes (mirror of SendData.kt Phase 2 work):
 ///
-/// 1. URLSession singleton — previously a new URLSession (with its own thread
-///    pool and connection pool) was created on EVERY beacon send.  URLSession
-///    is expensive; reusing a single shared instance reduces overhead.
+/// 1. Crash beacons go through `shouldSendCrashAnr()` instead of unconditional
+///    bypass. The new policy:
+///        s == 0  → drop (kill switch honored)
+///        s > 10  → always send (crash signal preserved at typical rates)
+///        s ≤ 10  → roll dice at s%
+///    Previously crash beacons skipped sampling entirely, which meant the
+///    kill switch couldn't actually kill anything when a customer's app
+///    started crashing.
 ///
-/// 2. coronaGoForced() — Screen beacons from Dart already passed the Dart-side
-///    SamplingManager before reaching Swift via the method channel.  Calling
-///    iOSSamplingManager.shared.shouldSend() again inside coronaGo() creates a
-///    double-sampling problem (e.g. 80% Dart × 90% iOS = 72% actual).
-///    coronaGoForced() attaches metadata and posts the beacon without the
-///    redundant second sampling roll.  Use it in FlutterSendData.
-///    coronaGo() retains the sampling gate for native-only beacons (crash,
-///    health signals sent directly from Swift without a prior Dart gate).
+/// 2. `cf` snapshot ({s, sa, crm, cv}) attached to every beacon in
+///    `appendCommonFields`, but ONLY if not already set by the caller.
+///    FlutterSendData.swift sets `cf` from a snapshot it captured before
+///    the beacon was constructed (so the same snapshot drives both filter
+///    decision and cf reporting). Native callers that don't pre-populate
+///    get the current snapshot at send time. The nil-check ensures we
+///    never overwrite a caller's already-consistent value.
 ///
-/// 3. OrionLogger used consistently throughout — no raw print() calls.
+/// Carryover from previous version:
+///
+/// 1. URLSession singleton — single shared instance instead of per-beacon
+///    creation. Significant overhead reduction.
+///
+/// 2. coronaGoForced() bypasses iOS sampling — used by FlutterSendData
+///    because Dart already gated this beacon. Without this, double-sampling
+///    silently under-delivers (e.g. 80% Dart × 90% iOS = 72% actual).
+///
+/// 3. OrionLogger used consistently — no raw print() calls.
 final class SendData {
 
     // MARK: - Constants
@@ -66,19 +79,28 @@ final class SendData {
 
     /// Send a beacon that is subject to the iOS native sampling gate.
     ///
-    /// Use for crash beacons and any beacon that originates purely from Swift
-    /// without a prior Dart-side sampling decision.
+    /// - Regular beacons (no `beaconType` or `beaconType != "crash"`): use
+    ///   `shouldSend()` — full dice-roll sampling.
+    /// - Crash/ANR beacons (`beaconType == "crash"`): use `shouldSendCrashAnr()`
+    ///   — lenient policy that always sends above 10% and honors the kill
+    ///   switch. Mirrors SamplingManager.kt.
     ///
-    /// Crash beacons set beaconType = "crash" and bypass sampling automatically.
+    /// Use this for any beacon that originates purely from Swift without a
+    /// prior Dart-side sampling decision (e.g. native crash handler).
     func coronaGo(_ data: [String: Any]) {
         var payload = data
 
-        // Sampling gate — only for non-crash, native-originated beacons.
         let beaconType = payload["beaconType"] as? String ?? "screen"
         let isCrash    = beaconType == "crash"
 
-        if !isCrash && !iOSSamplingManager.shared.shouldSend() {
-            OrionLogger.debug("SendData: beacon dropped by sampling (\(iOSSamplingManager.shared.getEffectivePercent())%)")
+        // ✅ V2: crash beacons get the lenient gate, not unconditional pass.
+        let allowed = isCrash
+            ? iOSSamplingManager.shared.shouldSendCrashAnr()
+            : iOSSamplingManager.shared.shouldSend()
+
+        if !allowed {
+            let kind = isCrash ? "crash" : "beacon"
+            OrionLogger.debug("SendData: \(kind) dropped by sampling (effective \(iOSSamplingManager.shared.getEffectivePercent())%)")
             return
         }
 
@@ -89,17 +111,18 @@ final class SendData {
     /// Send a beacon that BYPASSES the iOS native sampling gate.
     ///
     /// Use in FlutterSendData — the beacon already passed the Dart-side
-    /// SamplingManager before arriving here via the method channel.  Applying
+    /// SamplingManager before arriving here via the method channel. Applying
     /// a second independent sampling roll would silently under-deliver.
     ///
     /// Network connectivity is still checked; if there is no connection the
     /// beacon is dropped (nothing can be done without network).
     ///
-    /// Crash beacons must NOT use this — they use coronaGo() with beaconType
-    /// "crash" which already skips sampling.
+    /// Crash beacons must NOT use this path — they should use `coronaGo()`
+    /// with `beaconType = "crash"`, which now applies the lenient
+    /// `shouldSendCrashAnr()` policy.
     func coronaGoForced(_ data: [String: Any]) {
         var payload = data
-        // ✅ Sampling deliberately skipped — Dart already decided to send.
+        // Sampling deliberately skipped — Dart already decided to send.
         appendCommonFields(&payload)
         post(payload)
     }
@@ -112,6 +135,16 @@ final class SendData {
         payload["sesId"]       = SessionManager.getSessionId()
         payload["platform"]    = "ios"
         payload["startupType"] = StartupTypeTracker.shared.getStartupType()
+
+        // ✅ V2: cf snapshot. Only set if the caller hasn't already populated
+        //    it. FlutterSendData captures the snapshot before constructing the
+        //    beacon (so the same snapshot drives both filter decision and cf
+        //    reporting); honoring its pre-populated value preserves that
+        //    consistency. Native callers without a pre-existing cf get the
+        //    current snapshot at send time.
+        if payload["cf"] == nil {
+            payload["cf"] = iOSSamplingManager.shared.getConfigSnapshot()
+        }
     }
 
     private func post(_ payload: [String: Any]) {

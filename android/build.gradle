@@ -1,5 +1,5 @@
 group 'co.epsilondelta.orion_flutter'
-version '1.2.15'
+version '1.2.16'
 
 buildscript {
     ext.kotlin_version = '1.8.22'
@@ -53,7 +53,7 @@ android {
 
 dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8:$kotlin_version"
-    implementation('co.epsilondelta:orion-flutter:1.2.15') {
+    implementation('co.epsilondelta:orion-flutter:1.2.16') {
         exclude group: 'io.flutter', module: 'flutter_embedding_release'
     }
    // Debug build: bring in the plugin but strip out its embedded release-engine

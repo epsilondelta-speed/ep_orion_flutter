@@ -5,7 +5,7 @@
   "packages": [
     {
       "name": "orion_flutter",
-      "version": "1.2.15",
+      "version": "1.2.16",
       "dependencies": [
         "flutter"
       ],
@@ -24,13 +24,13 @@
       ]
     },
     {
-      "name": "vector_math",
-      "version": "2.1.4",
+      "name": "sky_engine",
+      "version": "0.0.0",
       "dependencies": []
     },
     {
-      "name": "sky_engine",
-      "version": "0.0.0",
+      "name": "vector_math",
+      "version": "2.1.4",
       "dependencies": []
     },
     {
