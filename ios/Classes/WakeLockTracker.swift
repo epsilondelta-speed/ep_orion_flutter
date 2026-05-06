@@ -15,6 +15,14 @@ import UIKit
 /// Sampling kill-switch:
 ///   trackAcquire() / trackRelease() return early when
 ///   iOSSamplingManager.shared.isTrackingEnabled is false.
+///
+/// Active-lock maxMs fix (Issue 3): getSessionMetrics() previously emitted
+/// `maxMs` from `metrics.maxHeldMs` — but that field is only updated in
+/// release(). For a currently-active lock that has never been released,
+/// `metrics.maxHeldMs` is 0, so the beacon reported `maxMs: 0` even when
+/// the lock had been held for several seconds. Now we compute the effective
+/// max as `max(metrics.maxHeldMs, currentHoldDuration)` for active locks,
+/// and apply the same correction at the top-level summary maxMs.
 final class WakeLockTracker {
 
     // MARK: - Singleton
@@ -276,21 +284,28 @@ final class WakeLockTracker {
         defer { lock.unlock() }
 
         let now = nowMs()
-        var additionalHeld: Double = 0
-        var additionalBg:   Double = 0
-        var currentlyActive = 0
+        var additionalHeld:    Double = 0
+        var additionalBg:      Double = 0
+        var longestActiveHeld: Double = 0   // ✅ track in-progress max for top-level
+        var currentlyActive   = 0
 
         for info in activeWakeLocks.values {
-            additionalHeld  += now - info.acquireTimeMs
-            currentlyActive += 1
+            let held = now - info.acquireTimeMs
+            additionalHeld    += held
+            currentlyActive   += 1
+            if held > longestActiveHeld { longestActiveHeld = held }
             if let bgStart = info.bgStartTimeMs { additionalBg += now - bgStart }
         }
+
+        // ✅ Issue 3 fix: the top-level maxMs must include any currently-active
+        //    hold that's already exceeded the longest completed hold.
+        let effectiveTopLevelMax = max(maxSingleHeldMs, longestActiveHeld)
 
         var result: [String: Any] = [
             "totalMs":       Int(totalHeldTimeMs + additionalHeld),
             "count":         totalAcquireCount,
             "bgMs":          Int(totalBgTimeMs + additionalBg),
-            "maxMs":         Int(maxSingleHeldMs),
+            "maxMs":         Int(effectiveTopLevelMax),
             "stuckCnt":      stuckCount,
             "stuckThreshMs": stuckThresholdMs,
             "activeCnt":     currentlyActive
@@ -310,11 +325,20 @@ final class WakeLockTracker {
                     extraHeld = now - activeInfo.acquireTimeMs
                     if let bgStart = activeInfo.bgStartTimeMs { extraBg = now - bgStart }
                 }
+
+                // ✅ Issue 3 fix: per-lock maxMs must consider the currently-active
+                //    hold's running duration. Without this, a lock that's been held
+                //    for 5 seconds (and never released) reports maxMs: 0 because
+                //    metrics.maxHeldMs is only updated in release().
+                let effectiveMax = isActive
+                    ? max(metrics.maxHeldMs, extraHeld)
+                    : metrics.maxHeldMs
+
                 var lockDict: [String: Any] = [
                     "tag":     metrics.tag,
                     "cnt":     metrics.acquireCount,
                     "totalMs": Int(metrics.totalHeldMs + extraHeld),
-                    "maxMs":   Int(metrics.maxHeldMs),
+                    "maxMs":   Int(effectiveMax),
                     "bgMs":    Int(metrics.backgroundMs + extraBg)
                 ]
                 if metrics.stuckCount > 0 { lockDict["stuck"] = metrics.stuckCount }

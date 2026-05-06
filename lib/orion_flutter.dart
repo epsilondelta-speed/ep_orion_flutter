@@ -14,8 +14,13 @@ class OrionFlutter {
   static const MethodChannel _channel = MethodChannel('orion_flutter');
 
   static bool _isReportingError = false;
-  static String? _lastException;
+
+  // ✅ Fix #14: dedupe by (exception + first stack frame) so two distinct
+  //    exceptions with the same message string aren't merged, and the same
+  //    exception rethrown from different sites isn't merged either.
+  static String? _lastErrorKey;
   static DateTime? _lastErrorTime;
+  static const Duration _errorDedupeWindow = Duration(seconds: 10);
 
   static bool get isAndroid   => Platform.isAndroid;
   static bool get isIOS       => Platform.isIOS;
@@ -62,6 +67,39 @@ class OrionFlutter {
 
   // Error beacons are NEVER gated by sampling — they always send.
 
+  /// Build a dedupe key from (exception text + first stack frame).
+  ///
+  /// Using just the exception string was too aggressive: two genuinely different
+  /// errors with identical messages got coalesced. Using exception + a single
+  /// site-identifying frame is much closer to "is this the same bug?" without
+  /// being so specific that a recurring bug avoids dedupe.
+  static String _buildDedupeKey(String exception, String stack) {
+    try {
+      // First non-empty line of the stack — typically the throw site or the
+      // top frame of the framework that raised the error.
+      final firstFrame = stack
+          .split('\n')
+          .map((s) => s.trim())
+          .firstWhere((s) => s.isNotEmpty, orElse: () => '');
+      return '$exception::$firstFrame';
+    } catch (_) {
+      return exception;
+    }
+  }
+
+  static bool _shouldDedupe(String exception, String stack) {
+    final key = _buildDedupeKey(exception, stack);
+    final now = DateTime.now();
+    if (_lastErrorKey == key &&
+        _lastErrorTime != null &&
+        now.difference(_lastErrorTime!) < _errorDedupeWindow) {
+      return true;
+    }
+    _lastErrorKey  = key;
+    _lastErrorTime = now;
+    return false;
+  }
+
   static Future<void> trackFlutterErrorRaw({
     required String exception,
     required String stack,
@@ -72,15 +110,12 @@ class OrionFlutter {
   }) async {
     if (!isSupported || _isReportingError) return;
 
-    if (_lastException == exception &&
-        _lastErrorTime != null &&
-        DateTime.now().difference(_lastErrorTime!) < const Duration(seconds: 10)) {
-      return;
-    }
+    // ✅ Fix #14: dedupe key now combines exception + first stack frame so
+    //    two distinct errors with the same message aren't merged, and the
+    //    same exception rethrown from different sites isn't merged either.
+    if (_shouldDedupe(exception, stack)) return;
 
     _isReportingError = true;
-    _lastException    = exception;
-    _lastErrorTime    = DateTime.now();
 
     try {
       await _channel.invokeMethod('trackFlutterError', {
@@ -147,10 +182,10 @@ class OrionFlutter {
       if (kDebugMode) {
         debugPrint(
           '\n========== ORION BEACON (Dart) ==========\n'
-          'screen=$screen ttid=$ttid ttfd=$ttfd '
-          'janky=$jankyFrames frozen=$frozenFrames '
-          'network=${network.length} rageClicks=$rageClickCount'
-          '\n=========================================',
+              'screen=$screen ttid=$ttid ttfd=$ttfd '
+              'janky=$jankyFrames frozen=$frozenFrames '
+              'network=${network.length} rageClicks=$rageClickCount'
+              '\n=========================================',
         );
       }
 
@@ -174,37 +209,38 @@ class OrionFlutter {
   }
 
   // ── App Lifecycle ─────────────────────────────────────────────────────────
+  //
+  // ✅ Fix #15: previously these methods wrapped invokeMethod in
+  // Future.microtask, which served no purpose — invokeMethod is already
+  // non-blocking, so wrapping it just added a scheduler hop. Now we
+  // fire-and-forget directly via unawaited(...) with errors swallowed.
+  //
+  // The functions still return Future<void> (signature unchanged) but
+  // complete synchronously while the channel call proceeds in the background.
 
   static Future<void> onAppForeground() async {
     if (!isSupported) return;
-    Future.microtask(() async {
-      try { await _channel.invokeMethod('onAppForeground'); } catch (_) {}
-    });
+    // Fire-and-forget — caller doesn't await the channel response.
+    _channel.invokeMethod('onAppForeground').catchError((_) => null);
   }
 
   static Future<void> onAppBackground() async {
     if (!isSupported) return;
-    Future.microtask(() async {
-      try { await _channel.invokeMethod('onAppBackground'); } catch (_) {}
-    });
+    _channel.invokeMethod('onAppBackground').catchError((_) => null);
   }
 
   static Future<void> onFlutterScreenStart(String screen) async {
     if (!isSupported) return;
-    Future.microtask(() async {
-      try {
-        await _channel.invokeMethod('onFlutterScreenStart', {'screen': screen});
-      } catch (_) {}
-    });
+    _channel
+        .invokeMethod('onFlutterScreenStart', {'screen': screen})
+        .catchError((_) => null);
   }
 
   static Future<void> onFlutterScreenStop(String screen) async {
     if (!isSupported) return;
-    Future.microtask(() async {
-      try {
-        await _channel.invokeMethod('onFlutterScreenStop', {'screen': screen});
-      } catch (_) {}
-    });
+    _channel
+        .invokeMethod('onFlutterScreenStop', {'screen': screen})
+        .catchError((_) => null);
   }
 
   // ── Sampling Debug ────────────────────────────────────────────────────────

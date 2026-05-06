@@ -14,6 +14,20 @@ import 'orion_sampling_manager.dart';
 /// successful HTTP response into an apparent error. Fixed by isolating tracking
 /// in its own try/catch that never re-throws.
 ///
+/// Double-install fix (Fix #9): install() now checks if the current global
+/// overrides is already an OrionHttpOverrides and short-circuits if so.
+/// Without this check, repeat calls to install() (multi-engine apps,
+/// Add-to-App with retained state, or future re-init paths) would chain
+/// Orion overrides — causing every HTTP request to be tracked once per layer
+/// (2x, 3x, ...). The signature of the problem is doubled `network` arrays
+/// in beacons and inflated request counts.
+///
+/// URL scheme fix (Fix #18): _OrionHttpClient.open() previously inferred
+/// the scheme from the port (port == 443 → "https" else "http"). This was
+/// wrong for HTTPS on non-443 ports (e.g., 8443, 9443) and HTTP on non-80
+/// ports — those would get the wrong scheme in tracked URLs. Now we ask
+/// the underlying HttpClientRequest for its actual URI after open() returns.
+///
 /// Sampling: _track() and _trackError() are no-ops when
 /// SamplingManager.instance.isTrackingEnabled is false.
 class OrionHttpOverrides extends HttpOverrides {
@@ -31,9 +45,23 @@ class OrionHttpOverrides extends HttpOverrides {
   }
 
   /// Install globally — safely chains with any existing HttpOverrides.
+  ///
+  /// Idempotent: if HttpOverrides.global is already an OrionHttpOverrides,
+  /// this is a no-op. Repeat calls would otherwise chain Orion-wrapping-Orion,
+  /// causing every HTTP request to be tracked once per layer.
   static void install() {
     try {
       final existing = HttpOverrides.current;
+
+      // ✅ Idempotency guard — skip if already installed.
+      //    Without this, repeat install() calls produce nested Orion layers,
+      //    each of which independently calls OrionNetworkTracker.addRequest(),
+      //    causing the `network` array in beacons to be 2x/3x/... duplicated.
+      if (existing is OrionHttpOverrides) {
+        debugPrint('[Orion] HttpOverrides: already installed, skipping');
+        return;
+      }
+
       HttpOverrides.global = OrionHttpOverrides(previous: existing);
       debugPrint('[Orion] HttpOverrides: installed');
     } catch (e) {
@@ -77,18 +105,16 @@ class _OrionHttpClient implements HttpClient {
   final HttpClient _inner;
   _OrionHttpClient(this._inner);
 
-  String _buildUrl(String host, int port, String path) {
-    final scheme  = port == 443 ? 'https' : 'http';
-    final portStr = (port == 80 || port == 443) ? '' : ':$port';
-    return _capUrl('$scheme://$host$portStr$path');
-  }
-
   @override
   Future<HttpClientRequest> open(
       String method, String host, int port, String path) async {
     final req = await _inner.open(method, host, port, path);
+    // ✅ Fix #18: read the actual URI from the underlying request rather than
+    //    reconstructing it from host/port (which incorrectly inferred scheme
+    //    from port == 443). The HttpClient already knows the correct scheme,
+    //    proxy state, and any normalisation it applied.
     return _OrionHttpClientRequest(
-        req, httpMethod: method, trackedUrl: _buildUrl(host, port, path));
+        req, httpMethod: method, trackedUrl: _capUrl(req.uri.toString()));
   }
 
   @override

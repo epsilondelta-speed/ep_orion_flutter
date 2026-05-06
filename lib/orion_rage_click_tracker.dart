@@ -27,12 +27,12 @@ class RageClick {
   });
 
   Map<String, dynamic> toJson() => {
-        'x': x.round(),
-        'y': y.round(),
-        'count': count,
-        'durMs': durationMs,
-        'ts': timestamp,
-      };
+    'x': x.round(),
+    'y': y.round(),
+    'count': count,
+    'durMs': durationMs,
+    'ts': timestamp,
+  };
 }
 
 /// Configuration for rage click detection
@@ -82,11 +82,19 @@ class RageClickConfig {
 }
 
 /// Tracks and detects rage clicks across the app
-/// 
+///
 /// Usage:
 /// 1. Call [recordTap] on every tap event
 /// 2. Call [getRageClicksForScreen] when screen exits to get detected rage clicks
 /// 3. Call [clearScreen] when screen exits after getting data
+///
+/// Bounds (Fix #17):
+///   - Tap history capped at _maxHistorySize (50) — already present
+///   - Per-screen rage click list capped at _maxRageClicksPerScreen (50)
+///   - Total tracked screens capped at _maxScreens (50)
+/// These mirror the bounds in OrionNetworkTracker so a screen that's never
+/// finalised (dialog routes, screens not registered with the route observer)
+/// can't grow unbounded.
 class OrionRageClickTracker {
   static OrionRageClickTracker? _instance;
   static OrionRageClickTracker get instance => _instance ??= OrionRageClickTracker._();
@@ -113,6 +121,10 @@ class OrionRageClickTracker {
 
   /// Cooldown after detecting a rage click (ms)
   static const int _detectionCooldownMs = 500;
+
+  // ✅ Fix #17: bounds matching OrionNetworkTracker.
+  static const int _maxScreens               = 50;
+  static const int _maxRageClicksPerScreen   = 50;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // Configuration
@@ -147,9 +159,22 @@ class OrionRageClickTracker {
 
   /// Set current screen name
   static void setCurrentScreen(String screenName) {
-    instance._currentScreen = screenName;
-    // Initialize list for this screen if not exists
-    instance._screenRageClicks.putIfAbsent(screenName, () => []);
+    final inst = instance;
+    inst._currentScreen = screenName;
+
+    // ✅ Fix #17: enforce max-screens bound. If the map already has
+    //    _maxScreens entries and this is a new key, drop the oldest entry
+    //    (insertion order in Dart Maps is preserved). Prevents unbounded
+    //    growth when screens are entered but never finalised — e.g. dialog
+    //    routes that aren't registered with the RouteObserver.
+    if (!inst._screenRageClicks.containsKey(screenName) &&
+        inst._screenRageClicks.length >= _maxScreens) {
+      final oldestKey = inst._screenRageClicks.keys.first;
+      inst._screenRageClicks.remove(oldestKey);
+      _log('Max screens limit ($_maxScreens) reached, evicted: $oldestKey');
+    }
+
+    inst._screenRageClicks.putIfAbsent(screenName, () => []);
   }
 
   /// Get current screen name
@@ -160,7 +185,7 @@ class OrionRageClickTracker {
   // ═══════════════════════════════════════════════════════════════════════════
 
   /// Record a tap event and check for rage click
-  /// 
+  ///
   /// [x] and [y] are in logical pixels (dp)
   /// Returns true if a rage click was detected
   static bool recordTap(double x, double y) {
@@ -206,7 +231,7 @@ class OrionRageClickTracker {
 
     // Find clusters of taps within radius
     final taps = _tapHistory.toList();
-    
+
     // Check if recent taps form a cluster
     // Use the most recent tap as anchor
     final anchor = taps.last;
@@ -231,10 +256,10 @@ class OrionRageClickTracker {
       final centerY = sumY / clusterTaps.length;
 
       // Calculate duration
-      final firstTap = clusterTaps.reduce((a, b) => 
-          a.timestamp < b.timestamp ? a : b);
-      final lastTap = clusterTaps.reduce((a, b) => 
-          a.timestamp > b.timestamp ? a : b);
+      final firstTap = clusterTaps.reduce((a, b) =>
+      a.timestamp < b.timestamp ? a : b);
+      final lastTap = clusterTaps.reduce((a, b) =>
+      a.timestamp > b.timestamp ? a : b);
       final duration = lastTap.timestamp - firstTap.timestamp;
 
       // Create rage click
@@ -248,8 +273,25 @@ class OrionRageClickTracker {
 
       // Store for current screen
       final screen = _currentScreen ?? 'Unknown';
-      _screenRageClicks.putIfAbsent(screen, () => []);
-      _screenRageClicks[screen]!.add(rageClick);
+
+      // ✅ Fix #17: enforce max-rage-clicks-per-screen bound.
+      //    The same defensive pattern as OrionNetworkTracker — a screen with
+      //    extreme tap activity (or one that's never finalised) can't grow
+      //    its rage click list unboundedly.
+      if (!_screenRageClicks.containsKey(screen) &&
+          _screenRageClicks.length >= _maxScreens) {
+        final oldestKey = _screenRageClicks.keys.first;
+        _screenRageClicks.remove(oldestKey);
+        _log('Max screens limit ($_maxScreens) reached, evicted: $oldestKey');
+      }
+
+      final clicks = _screenRageClicks.putIfAbsent(screen, () => []);
+      if (clicks.length >= _maxRageClicksPerScreen) {
+        _log('Max rage clicks per screen ($_maxRageClicksPerScreen) reached '
+            'for $screen, dropping new detection');
+      } else {
+        clicks.add(rageClick);
+      }
 
       // Update last detection time
       _lastRageClickTime = now;

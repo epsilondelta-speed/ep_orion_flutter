@@ -15,6 +15,24 @@ import 'orion_sampling_manager.dart';
 /// Dead code removed: _ttfdManual field was set in _pollForManualTTFD() but
 /// never read — send() derived the same value from _ttfdSource == 'manual'.
 /// Removed the field; the derived expression is the single source of truth.
+///
+/// Leak fix (Fix #10): _startTracking() previously overwrote any existing
+/// _ScreenMetrics for the same screen name without finalising it. The orphan
+/// kept its frame callback chain alive (re-scheduling itself via
+/// SchedulerBinding.scheduleFrameCallback) and its Stopwatch running, leaking
+/// resources for the rest of the app's lifetime. Now we mirror the pattern in
+/// OrionManualTracker.startTracking and finalise the previous tracker first.
+///
+/// Why send() uses Future.delayed and NOT addPostFrameCallback:
+/// I tried switching to WidgetsBinding.instance.addPostFrameCallback to avoid
+/// the arbitrary 100ms wait, but addPostFrameCallback only fires when a frame
+/// is drawn. If the app is backgrounded (or transitioning) when send() is
+/// called, the callback queues up indefinitely and fires all-at-once when the
+/// app foregrounds — which can compound with other deferred work and cause
+/// input-dispatch ANRs. Future.delayed is independent of frame scheduling, so
+/// it fires reliably even during lifecycle transitions. We accept the tradeoff
+/// that a process kill within 100ms of leaving a screen drops that beacon —
+/// rare in practice and safer than the alternative.
 class OrionScreenTracker extends RouteObserver<PageRoute<dynamic>> {
   final Map<String, _ScreenMetrics> _screenMetrics = {};
 
@@ -88,6 +106,25 @@ class OrionScreenTracker extends RouteObserver<PageRoute<dynamic>> {
     try {
       if (route is PageRoute) {
         final screenName = route.settings.name ?? route.runtimeType.toString();
+
+        // ✅ Fix #10: finalise any existing tracker for the same screen name
+        //    before starting a new one. Without this, the previous tracker is
+        //    silently overwritten — its Stopwatch keeps running and its frame
+        //    callback keeps re-scheduling itself via scheduleFrameCallback,
+        //    leaking resources for the lifetime of the app.
+        //
+        //    Real-world trigger: nested navigation that pushes the same named
+        //    route twice without a pop in between (rare but happens with
+        //    bottom-nav apps that allow stacking duplicate screens).
+        if (_screenMetrics.containsKey(screenName)) {
+          orionPrint(
+            '⚠️ OrionScreenTracker: already tracking $screenName, '
+                'finalising previous tracker before starting new one',
+          );
+          final previous = _screenMetrics.remove(screenName);
+          previous?.send();
+        }
+
         final metrics = _ScreenMetrics(screenName);
         _screenMetrics[screenName] = metrics;
         metrics.begin();
@@ -414,6 +451,18 @@ class _ScreenMetrics {
     if (!OrionFlutter.isSupported || _disposed) return;
     _disposed = true;
 
+    // ⚠️ Reverted from addPostFrameCallback back to Future.delayed.
+    //    addPostFrameCallback only fires when a frame is drawn — if the app
+    //    is backgrounded or transitioning when send() is called, the callback
+    //    queues up and fires all at once on the next frame. Combined with
+    //    Fix #10's "finalise previous before starting new" logic, this can
+    //    pile multiple awaited platform channel calls onto one frame and
+    //    contribute to input-dispatch ANRs.
+    //
+    //    Future.delayed fires from the event loop independent of frame
+    //    scheduling, so it works reliably during lifecycle transitions.
+    //    Tradeoff: 100ms after-the-fact wait that can be lost on process
+    //    kill — acceptable, since the original code shipped this way.
     Future.delayed(const Duration(milliseconds: 100), () async {
       try {
         if (!OrionFlutter.isSupported) return;
@@ -432,15 +481,14 @@ class _ScreenMetrics {
 
         orionPrint(
           '📤 [$screenName] Sending beacon — '
-          'TTID: $_ttid ms, TTFD: $_ttfd ms (source: $_ttfdSource), '
-          'Network: ${networkData.length}, RageClicks: $rageClickCount',
+              'TTID: $_ttid ms, TTFD: $_ttfd ms (source: $_ttfdSource), '
+              'Network: ${networkData.length}, RageClicks: $rageClickCount',
         );
 
         final frameBeacon = frameMetrics.toBeacon();
         frameBeacon['ttfdSrc'] = _ttfdSource;
         if (_userInteracted) frameBeacon['intTime'] = _interactionTime;
 
-        // ✅ await so exceptions from the channel call are caught below.
         await OrionFlutter.trackFlutterScreen(
           screen:         screenName,
           ttid:           _ttid,

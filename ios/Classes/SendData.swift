@@ -174,5 +174,21 @@ final class SendData {
 struct OrionConfig {
     static var companyId: String = ""
     static var projectId: String = ""
-    static let sdkVersion: String = "1.0.8"
+
+    /// SDK version — read from the SDK bundle's CFBundleShortVersionString so it
+    /// is always in sync with the podspec version, exactly as Android reads it from
+    /// BuildConfig.ORION_SDK_VERSION (injected by build.gradle's orionSdkVersion).
+    /// Falls back to a hardcoded string only if the bundle lookup fails.
+    static let sdkVersion: String = {
+        // Bundle.module refers to the resource bundle for the Swift package / pod.
+        // For a CocoaPod, Bundle(for:) with any class from the SDK resolves the
+        // correct bundle even when the pod is embedded as a static or dynamic framework.
+        let bundle = Bundle(identifier: "co.epsilondelta.orion-flutter")
+            ?? Bundle(for: OrionFlutterPluginMarker.self)
+        return bundle.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.2.10"
+    }()
 }
+
+// Marker class used solely for Bundle(for:) lookup above.
+// Must be in the same module as OrionFlutterPlugin.
+private final class OrionFlutterPluginMarker {}
