@@ -3,15 +3,76 @@ import Foundation
 /// FlutterSendData — Assembles the full beacon JSON and sends via SendData.
 /// Mirrors FlutterSendData.kt exactly + adds iOS-specific fields.
 ///
-/// Double-sampling fix: uses coronaGoForced() instead of coronaGo().
-/// The Dart SamplingManager already decided to send this beacon before calling
-/// the Swift method channel.  coronaGo() would apply a second independent iOS
-/// sampling roll, silently reducing delivery rate below the intended percentage.
+/// V2 changes (mirror of FlutterSendData.kt Phase 3 work):
+///
+/// 1. Analytics URL filtering. When iOSSamplingManager.shouldFilterAnalytics()
+///    is true (i.e. the resolved `sa` field is false, the default), URLs
+///    matching well-known third-party analytics hosts (Google Analytics,
+///    Firebase Installations, Amplitude, Mixpanel, Segment, Snowplow,
+///    AppsFlyer, Adjust, Branch, CleverTap, MoEngage, Crashlytics, Sentry,
+///    app-measurement) are stripped from the beacon's `network[]` array.
+///
+/// 2. Orion-internal URLs (cdn.epsilondelta.co, www.ed-sys.net) are stripped
+///    unconditionally — these are the SDK's own beacon-send and config-fetch
+///    endpoints and shouldn't be reported as customer traffic.
+///
+/// 3. The `cf` field is attached to every beacon, carrying the resolved
+///    sampling-config snapshot {s, sa, crm, cv} that produced this beacon.
+///    Backend uses this to interpret each beacon with full context.
+///
+/// Carryover from the previous file:
+///
+/// * coronaGoForced() (not coronaGo()) — Dart's SamplingManager already
+///   decided to send this beacon. Using coronaGo() would apply a second
+///   independent iOS sampling roll, e.g. 80% Dart × 90% iOS = 72% actual
+///   delivery instead of the intended 80%.
+///
+/// * iOS-specific iosHealth field set here, not in AppMetrics.getAppMetrics(),
+///   to keep iOSHealthTracker.getSessionMetrics() called exactly once per beacon.
 final class FlutterSendData {
 
     // MARK: - Singleton
     static let shared = FlutterSendData()
     private init() {}
+
+    // MARK: - Filter host lists
+    //
+    // Substring match — lowercased. Mirror FlutterSendData.kt ANALYTICS_HOSTS.
+    // Order doesn't matter; we just check for any match.
+
+    private static let analyticsHosts: [String] = [
+        "google-analytics.com",
+        "firebaseinstallations.googleapis.com",
+        "app-measurement.com",
+        "crashlytics",
+        "sentry.io",
+        "snowplowanalytics.com",
+        "snowplow",
+        "segment.io",
+        "segment.com",
+        "mixpanel.com",
+        "amplitude.com",
+        "appsflyer.com",
+        "adjust.com",
+        "branch.io",
+        "clevertap.com",
+        "moengage.com"
+    ]
+
+    private static let orionInternalHosts: [String] = [
+        "cdn.epsilondelta.co",
+        "www.ed-sys.net"
+    ]
+
+    private static func isAnalyticsUrl(_ url: String) -> Bool {
+        let lower = url.lowercased()
+        return analyticsHosts.contains(where: { lower.contains($0) })
+    }
+
+    private static func isOrionInternalUrl(_ url: String) -> Bool {
+        let lower = url.lowercased()
+        return orionInternalHosts.contains(where: { lower.contains($0) })
+    }
 
     // MARK: - Main entry point
 
@@ -31,6 +92,12 @@ final class FlutterSendData {
     ) {
         MemoryMetricsTracker.shared.onScreenTransition()
 
+        // Read sampling config snapshot ONCE per beacon. The same snapshot
+        // drives both the filter decision and the cf field, so they always
+        // agree — backend reading cf knows exactly which filter was applied.
+        let cfSnapshot      = iOSSamplingManager.shared.getConfigSnapshot()
+        let filterAnalytics = iOSSamplingManager.shared.shouldFilterAnalytics()
+
         let batteryMetrics  = BatteryMetricsTracker.shared.getSessionMetrics()
         let memoryMetrics   = MemoryMetricsTracker.shared.getSessionMetrics()
         let wakeLockMetrics = WakeLockTracker.shared.getSessionMetrics()
@@ -45,7 +112,7 @@ final class FlutterSendData {
             "ttfdManual":   ttfdManual,
             "jankyFrames":  jankyFrames,
             "frozenFrames": frozenFrames,
-            "network":      buildNetworkArray(networkRequests),
+            "network":      buildNetworkArray(networkRequests, filterAnalytics: filterAnalytics),
             "wentBg":       wentBg
         ]
 
@@ -84,21 +151,43 @@ final class FlutterSendData {
             if beacon[key] == nil { beacon[key] = value }
         }
 
-        OrionLogger.debug("FlutterSendData: 📤 Sending beacon for '\(screenName)'")
+        // cf snapshot — added LAST so nothing else can clobber it. Carries the
+        // resolved {s, sa, crm, cv} that produced this beacon.
+        beacon["cf"] = cfSnapshot
+
+        OrionLogger.debug("FlutterSendData: 📤 Sending beacon for '\(screenName)' (filter=\(filterAnalytics))")
 
         // ✅ coronaGoForced — Dart SamplingManager already gated this beacon.
-        //    Using coronaGo() would apply a second independent iOS sampling roll,
-        //    e.g. 80% Dart × 90% iOS = 72% actual delivery (not 80%).
         SendData().coronaGoForced(beacon)
     }
 
     // MARK: - Network Array Builder
 
-    private func buildNetworkArray(_ requests: [[String: Any?]]) -> [[String: Any]] {
-        return requests.compactMap { req in
+    private func buildNetworkArray(
+        _ requests: [[String: Any?]],
+        filterAnalytics: Bool
+    ) -> [[String: Any]] {
+        var out: [[String: Any]] = []
+        out.reserveCapacity(requests.count)
+
+        for req in requests {
+            let url = req["url"] as? String ?? ""
+
+            // Always strip our own beacon-send and config-fetch endpoints.
+            if FlutterSendData.isOrionInternalUrl(url) {
+                continue
+            }
+
+            // Strip third-party analytics URLs only when the filter is on
+            // (cf.sa=false, the default). When sa=true, customer has opted
+            // in to seeing them and we pass them through.
+            if filterAnalytics && FlutterSendData.isAnalyticsUrl(url) {
+                continue
+            }
+
             var obj: [String: Any] = [
-                "url":        req["url"]        as? String ?? "",
-                "method":     req["method"]     as? String ?? "",
+                "url":        url,
+                "method":     req["method"]      as? String ?? "",
                 "statusCode": (req["statusCode"] as? NSNumber)?.intValue ?? -1,
                 "startTime":  (req["startTime"]  as? NSNumber)?.int64Value ?? 0,
                 "endTime":    (req["endTime"]    as? NSNumber)?.int64Value ?? 0,
@@ -109,8 +198,9 @@ final class FlutterSendData {
             if let at = req["actualTime"]   as? NSNumber { obj["actualTime"]   = at.intValue }
             if let rt = req["responseType"] as? String   { obj["responseType"] = rt }
             if let ct = req["contentType"]  as? String   { obj["contentType"]  = ct }
-            return obj
+            out.append(obj)
         }
+        return out
     }
 
     // MARK: - Rage Clicks Array Builder
