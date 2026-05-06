@@ -1,3 +1,10 @@
+## 1.2.16
+
+### iOS V2 sampling parity
+
+- iOSSamplingManager migrated to V2 schema (`confOriSamplV2.json`).
+
+
 ## 1.2.15
 
 ### Added
