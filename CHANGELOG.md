@@ -1,3 +1,11 @@
+## 1.2.17
+
+### No code changes
+
+This is a build-config-only release. SDK source code, behavior, beacon schema,
+and iOS implementation are identical to 1.2.16. The fix is purely in how the
+customer's app resolves the SDK's transitive dependencies at runtime.
+
 ## 1.2.16
 
 ### iOS V2 sampling parity
