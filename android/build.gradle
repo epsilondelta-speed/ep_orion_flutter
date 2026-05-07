@@ -53,14 +53,24 @@ android {
 
 dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8:$kotlin_version"
+
     implementation('co.epsilondelta:orion-flutter:1.2.16') {
         exclude group: 'io.flutter', module: 'flutter_embedding_release'
     }
-   // Debug build: bring in the plugin but strip out its embedded release-engine
-      // debugImplementation("co.epsilondelta:orion-flutter:1.0.9") {
-       //     exclude group: "io.flutter", module: "flutter_embedding_release"
-       //  }
 
-       // Release build: bring in the plugin normally (so the release-engine is included)
-      //  releaseImplementation("co.epsilondelta:orion-flutter:1.0.9")
+    // Runtime dependencies used by the AAR's compiled code.
+    //
+    // The published AAR is compile-only as far as transitive deps go (its POM
+    // does not list runtime requirements), so this build.gradle is the
+    // single source of truth for what the customer's app must have on its
+    // runtime classpath. Without these, customers crash with
+    // NoClassDefFoundError on first beacon attempt (1.2.16 regression).
+    //
+    // Versions are conservative — most modern Flutter apps already use
+    // higher versions, and Gradle resolves to the higher of two declarations.
+    implementation "com.squareup.okhttp3:okhttp:4.12.0"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.6.4"
+    implementation "androidx.annotation:annotation:1.6.0"
+    implementation "androidx.core:core-ktx:1.10.1"
+    implementation "androidx.fragment:fragment-ktx:1.6.0"
 }
