@@ -1,3 +1,13 @@
+## 1.2.18
+
+**Fixes**
+
+- Added consumer ProGuard rules (`consumer-rules.pro`) shipped with the SDK.
+  Customer release builds with R8/ProGuard minification will now succeed
+  without requiring any consumer-side ProGuard configuration. Fixes
+  "Compilation failed to complete: OrionFlutterPlugin.class" during R8
+  transformation reported in customer integrations.
+
 ## 1.2.17
 
 ### No code changes
