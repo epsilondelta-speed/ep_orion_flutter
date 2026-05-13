@@ -5,7 +5,7 @@
   "packages": [
     {
       "name": "orion_flutter",
-      "version": "1.2.20",
+      "version": "1.2.21",
       "dependencies": [
         "flutter"
       ],
