@@ -1,3 +1,22 @@
+## 1.2.21
+
+**Hotfix — fixes BuildConfig duplicate-class error**
+
+- ep_orion_flutter's android/build.gradle now sets `buildFeatures { buildConfig false }`.
+  Without this, AGP generates an empty BuildConfig.class for the
+  customer-facing plugin module, which conflicts with the Maven AAR's
+  BuildConfig.class (containing ORION_SDK_VERSION) — causing "Duplicate
+  class co.epsilondelta.orion_flutter.BuildConfig" on customer release
+  builds running checkDuplicateClasses.
+
+  Customers don't need to do anything beyond bumping their pubspec.yaml
+  ref to v1.2.21. The Maven AAR's BuildConfig still provides
+  ORION_SDK_VERSION as before.
+
+  **Customer action:** if you are upgrading from 1.2.20 (recommended)
+  just bump the ref. If you are upgrading from <=1.2.18, also remove
+  any subprojects/afterEvaluate workaround you may have added.
+
 ## 1.2.20
 
 **Hotfix — re-publish of 1.2.19**
