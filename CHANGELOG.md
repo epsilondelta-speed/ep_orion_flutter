@@ -1,3 +1,22 @@
+## 1.2.19
+
+**Architectural Change — duplicate class issue for BB**
+
+- Refactored the Android plugin entry point to eliminate the duplicate-class
+  error that occurred on customer release builds running
+  `checkDuplicateClasses`. The compiled SDK class is now named
+  `OrionFlutterPluginCore`; the customer-facing plugin provides a thin
+  `OrionFlutterPlugin` wrapper that extends it. Since the two classes have
+  distinct names, they coexist on the customer's classpath without conflict.
+
+  **Customer action:** Customers who previously added a
+  `subprojects/afterEvaluate` workaround (excluding `OrionFlutterPlugin.kt`
+  from compilation) MUST REMOVE that workaround when upgrading to 1.2.19.
+  Leaving it in place will strip the wrapper class and cause runtime
+  registration failure.
+
+- (Carried forward from 1.2.18) Consumer ProGuard rules bundled with the AAR.
+
 ## 1.2.18
 
 **Fixes**
