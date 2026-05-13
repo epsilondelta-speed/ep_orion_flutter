@@ -55,6 +55,10 @@ final class iOSSamplingManager {
     private let defaultConfigVer:    String = "1.0"
 
     // MARK: - State (guarded by lock)
+    // SDK-bundled fallback beacon URL. Used until first successful config fetch
+    // and as fallback if config has no `bu` field or has an invalid one. 1.2.22.
+    private let defaultBeaconURL: String = "https://www.ed-sys.net/oriData"
+
     private var cid:             String = ""
     private var pid:             String = ""
     private var localRate:       Int    = 100
@@ -66,6 +70,9 @@ final class iOSSamplingManager {
     private var resolvedRawSa:      Bool?   = nil
     private var resolvedRefreshMin: Int?    = nil
     private var resolvedConfigVer:  String? = nil
+    // Per-company beacon URL override (1.2.22). Resolved from the `bu` field
+    // in the sampling config. Defaults to defaultBeaconURL when nil.
+    private var resolvedBeaconURL:  String? = nil
 
     private let lock = NSLock()
     private var refreshTimer: DispatchSourceTimer?
@@ -244,17 +251,19 @@ final class iOSSamplingManager {
             let sa  = self.resolveBool(json,   field: "sa",  default: self.defaultFilterRawSa)
             let crm = self.resolveInt(json,    field: "crm", default: self.defaultRefreshMin)
             let cv  = self.resolveStringGlobal(json, field: "cv", default: self.defaultConfigVer)
+            let bu  = self.resolveBeaconURL(json)
 
             self.lock.lock()
             self.resolvedPercent    = s
             self.resolvedRawSa      = sa
             self.resolvedRefreshMin = crm
             self.resolvedConfigVer  = cv
+            self.resolvedBeaconURL  = bu
             self.configLoaded       = true
             let needsTimerRestart   = (crm != self.currentTimerIntervalMin)
             self.lock.unlock()
 
-            OrionLogger.debug("iOSSamplingManager: config loaded — s=\(s) sa=\(sa) crm=\(crm) cv=\(cv)")
+            OrionLogger.debug("iOSSamplingManager: config loaded — s=\(s) sa=\(sa) crm=\(crm) cv=\(cv) bu=\(bu)")
 
             // Restart timer if crm changed. Done outside the lock; DispatchSourceTimer
             // cancel/recreate is safe to call from any queue.
@@ -269,6 +278,45 @@ final class iOSSamplingManager {
     //
     // Priority chain per FIELD: c[cid].p[pid].FIELD → c[cid].FIELD → FIELD → default.
     // `cv` is the exception — it's GLOBAL ONLY, no per-cid/pid override.
+
+    /// Currently resolved beacon URL. Used by SendData (and crash analyzers if
+    /// any) when posting beacons. Defaults to defaultBeaconURL before the first
+    /// successful config fetch and as fallback when config has no valid `bu`.
+    public var beaconURL: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return resolvedBeaconURL ?? defaultBeaconURL
+    }
+
+    /// Resolves the `bu` field with the same 3-level priority as other config
+    /// fields. Has its own helper instead of using a generic resolveString
+    /// because we want URL validation (must be non-blank HTTPS).
+    private func resolveBeaconURL(_ config: [String: Any]) -> String {
+        if !cid.isEmpty,
+           let cidEntry = (config["c"] as? [String: Any])?[cid] as? [String: Any] {
+            if !pid.isEmpty,
+               let pidEntry = (cidEntry["p"] as? [String: Any])?[pid] as? [String: Any],
+               let v = validateBeaconURL(pidEntry["bu"]) {
+                return v
+            }
+            if let v = validateBeaconURL(cidEntry["bu"]) {
+                return v
+            }
+        }
+        if let v = validateBeaconURL(config["bu"]) {
+            return v
+        }
+        return defaultBeaconURL
+    }
+
+    private func validateBeaconURL(_ value: Any?) -> String? {
+        guard let s = value as? String, !s.isEmpty else { return nil }
+        guard s.hasPrefix("https://") else {
+            OrionLogger.debug("iOSSamplingManager: ignoring invalid bu (not https): \(s)")
+            return nil
+        }
+        return s
+    }
 
     private func resolveInt(_ config: [String: Any], field: String, default fallback: Int) -> Int {
         // c[cid].p[pid].field

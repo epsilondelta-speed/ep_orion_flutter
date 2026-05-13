@@ -47,6 +47,12 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
     // pointers cannot capture context from the enclosing Swift scope.
     private static var previousUncaughtExceptionHandler: (@convention(c) (NSException) -> Void)? = nil
 
+    /// Kill switch — when true, all non-crash beacons are suppressed by
+    /// SendData.coronaGo / SendData.coronaGoForced. Crash beacons use
+    /// sendBeaconDirect which bypasses this. Matches Android EdOrion
+    /// .disable()/.enable() contract. Added in 1.2.22.
+    @objc public static var isDisabled: Bool = false
+
     // MARK: - Method Channel Handler
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -61,6 +67,8 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
         case "onFlutterScreenStop":         handleScreenStop(args: args, result: result)
         case "trackFlutterScreen":          handleTrackScreen(args: args, result: result)
         case "trackFlutterError":           handleTrackError(args: args, result: result)
+        case "disable":                     handleDisable(result: result)
+        case "enable":                      handleEnable(result: result)
         case "wakeLockAcquire":             handleWakeLockAcquire(args: args, result: result)
         case "wakeLockRelease":             handleWakeLockRelease(args: args, result: result)
         case "wakeLockTrackAcquire":        handleWakeLockTrackAcquire(args: args, result: result)
@@ -182,6 +190,42 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
         } catch {
             OrionLogger.error("OrionFlutterPlugin: handleAppForeground error — \(error)")
             result(FlutterError(code: "APP_FOREGROUND_ERROR", message: error.localizedDescription, details: nil))
+        }
+    }
+
+    // MARK: - Kill Switch (1.2.22)
+    //
+    // Idempotent disable/enable. Mirrors Android EdOrion.disable()/.enable():
+    //   - disable() flips isDisabled to true; SendData.coronaGo and
+    //     coronaGoForced both short-circuit when true (gated in SendData.swift).
+    //   - enable() flips isDisabled back to false.
+    //   - Both are no-ops if state is already what we want to transition to.
+    //   - Crash beacons (FlutterCrashAnalyzer / AppCrashAnalyzer) bypass this
+    //     via their own sendBeaconDirect paths — same contract as Android.
+
+    private func handleDisable(result: @escaping FlutterResult) {
+        do {
+            if !OrionFlutterPlugin.isDisabled {
+                OrionFlutterPlugin.isDisabled = true
+                OrionLogger.debug("OrionFlutterPlugin: SDK disabled at runtime — all tracking stopped")
+            }
+            result("disabled")
+        } catch {
+            OrionLogger.error("OrionFlutterPlugin: handleDisable error — \(error)")
+            result(FlutterError(code: "DISABLE_ERROR", message: error.localizedDescription, details: nil))
+        }
+    }
+
+    private func handleEnable(result: @escaping FlutterResult) {
+        do {
+            if OrionFlutterPlugin.isDisabled {
+                OrionFlutterPlugin.isDisabled = false
+                OrionLogger.debug("OrionFlutterPlugin: SDK re-enabled at runtime")
+            }
+            result("enabled")
+        } catch {
+            OrionLogger.error("OrionFlutterPlugin: handleEnable error — \(error)")
+            result(FlutterError(code: "ENABLE_ERROR", message: error.localizedDescription, details: nil))
         }
     }
 

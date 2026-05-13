@@ -243,6 +243,22 @@ class OrionFlutter {
         .catchError((_) => null);
   }
 
+  // Kill Switch (1.2.22)
+  //
+  // Disable/enable the SDK at runtime. While disabled, screen/network/perf
+  // beacons are dropped. Crash beacons still report (Android: sendBeaconDirect
+  // bypass; iOS: SendData guards only screen/network/perf, crashes go via
+  // their own sendBeaconDirect path). Idempotent on both sides — calling
+  // disable() when already disabled is a no-op.
+  static Future<void> disable() async {
+    if (!isSupported) return;
+    _channel.invokeMethod('disable').catchError((_) => null);
+  }
+  static Future<void> enable() async {
+    if (!isSupported) return;
+    _channel.invokeMethod('enable').catchError((_) => null);
+  }
+
   // ── Sampling Debug ────────────────────────────────────────────────────────
 
   static int get effectiveSamplingPercent =>
