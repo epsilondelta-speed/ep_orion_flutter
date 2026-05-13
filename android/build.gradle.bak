@@ -1,5 +1,5 @@
 group 'co.epsilondelta.orion_flutter'
-version '1.2.21'
+version '1.2.20'
 
 buildscript {
     ext.kotlin_version = '1.8.22'
@@ -49,21 +49,12 @@ android {
     defaultConfig {
         minSdkVersion 21
     }
-
-    // ✅ Disable BuildConfig generation. The Orion Maven AAR already ships
-    //    its own BuildConfig with ORION_SDK_VERSION. Without this, AGP
-    //    generates an empty BuildConfig.class for this module too, causing
-    //    "Duplicate class co.epsilondelta.orion_flutter.BuildConfig" on
-    //    customer release builds. Added in 1.2.21 after BB hit this.
-    buildFeatures {
-        buildConfig false
-    }
 }
 
 dependencies {
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8:$kotlin_version"
 
-    implementation('co.epsilondelta:orion-flutter:1.2.21') {
+    implementation('co.epsilondelta:orion-flutter:1.2.20') {
         exclude group: 'io.flutter', module: 'flutter_embedding_release'
     }
 
