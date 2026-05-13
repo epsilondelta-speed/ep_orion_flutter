@@ -35,7 +35,8 @@ import Network
 final class SendData {
 
     // MARK: - Constants
-    private static let beaconURL          = "https://www.ed-sys.net/oriData"
+    // Beacon URL is owned by iOSSamplingManager (1.2.22) — per-company `bu`
+    // override with hardcoded default fallback. Read via the .shared singleton.
     private static let connectTimeoutSec: TimeInterval = 10
     private static let readTimeoutSec:    TimeInterval = 10
 
@@ -88,6 +89,13 @@ final class SendData {
     /// Use this for any beacon that originates purely from Swift without a
     /// prior Dart-side sampling decision (e.g. native crash handler).
     func coronaGo(_ data: [String: Any]) {
+        // Kill switch — when SDK is disabled at runtime, drop all beacons
+        // except crash/ANR (those use sendBeaconDirect which bypasses this).
+        // Matches Android EdOrion.disable()/.enable() contract. Added 1.2.22.
+        guard !OrionFlutterPlugin.isDisabled else {
+            OrionLogger.debug("SendData.coronaGo: skipping - SDK disabled")
+            return
+        }
         var payload = data
 
         let beaconType = payload["beaconType"] as? String ?? "screen"
@@ -121,6 +129,13 @@ final class SendData {
     /// with `beaconType = "crash"`, which now applies the lenient
     /// `shouldSendCrashAnr()` policy.
     func coronaGoForced(_ data: [String: Any]) {
+        // Kill switch — when SDK is disabled at runtime, drop all beacons
+        // except crash/ANR (those use sendBeaconDirect which bypasses this).
+        // Matches Android EdOrion.disable()/.enable() contract. Added 1.2.22.
+        guard !OrionFlutterPlugin.isDisabled else {
+            OrionLogger.debug("SendData.coronaGoForced: skipping — SDK disabled")
+            return
+        }
         var payload = data
         // Sampling deliberately skipped — Dart already decided to send.
         appendCommonFields(&payload)
@@ -169,7 +184,7 @@ final class SendData {
     // MARK: - HTTP POST
 
     private func httpsPost(_ data: [String: Any]) {
-        guard let url = URL(string: Self.beaconURL) else {
+        guard let url = URL(string: iOSSamplingManager.shared.beaconURL) else {
             OrionLogger.error("SendData: Invalid beacon URL")
             return
         }
