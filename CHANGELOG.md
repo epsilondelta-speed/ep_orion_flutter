@@ -1,3 +1,18 @@
+## 1.2.20
+
+**Hotfix — re-publish of 1.2.19**
+
+- Republishes 1.2.19's architectural change (OrionFlutterPlugin → OrionFlutterPluginCore
+  rename) with a complete AAR. The 1.2.19 release shipped with an empty
+  OrionFlutterPluginCore.kt source file due to a local file-corruption
+  issue between verification and release-script execution, causing the
+  AAR to be missing the OrionFlutterPluginCore class entirely.
+
+  **Customer action:** Use 1.2.20 instead of 1.2.19. Same notes as 1.2.19
+  apply: customers who previously added a `subprojects/afterEvaluate`
+  workaround MUST remove it when upgrading.
+-
+
 ## 1.2.19
 
 **Architectural Change — duplicate class issue for BB**
