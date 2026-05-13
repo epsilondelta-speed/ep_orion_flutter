@@ -1,3 +1,23 @@
+## 1.2.22
+
+**Features**
+
+-  beacon URL override config
+-  Runtime kill switch added
+- Bug fixes
+
+**Bug fixes**
+
+- **`cf` field now attached to every beacon type.** Previously the V2 sampling
+  configuration snapshot was only attached to beacons going through
+  `SendData.appendCommonFields`. Flutter screen beacons (FlutterSendData),
+  native crash beacons (AppCrashAnalyzer), and Flutter crash beacons
+  (FlutterCrashAnalyzer) all bypassed this and reached the backend with empty
+  `cf`, breaking per-beacon sampling-decision attribution in the dashboard.
+  Now explicitly injected at the start of each send path.
+
+
+
 ## 1.2.21
 
 **Hotfix — fixes BuildConfig duplicate-class error**
