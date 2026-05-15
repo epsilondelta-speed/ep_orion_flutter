@@ -1,4 +1,4 @@
-##1.2.23
+## 1.2.23
 
 **Critical fix.** Resolves `MissingPluginException` affecting v1.2.19 through
 v1.2.22. The customer-facing plugin module was being silently dropped from
