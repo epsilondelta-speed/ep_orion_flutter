@@ -1,3 +1,13 @@
+##1.2.23
+
+**Critical fix.** Resolves `MissingPluginException` affecting v1.2.19 through
+v1.2.22. The customer-facing plugin module was being silently dropped from
+Flutter's `GeneratedPluginRegistrant` due to two packaging issues (missing
+`AndroidManifest.xml`, wrapper class inheritance not detected by Flutter's
+plugin tool). All customers on v1.2.19–v1.2.22 should upgrade. Same API,
+no code changes required.
+
+
 ## 1.2.22
 
 **Features**
