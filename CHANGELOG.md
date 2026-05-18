@@ -1,3 +1,9 @@
+## 1.2.24
+
+- **Dart:** frame cap raised 2,000 → 5,000 (~33 s → ~83 s tracking window); jank cluster cap raised 10 → 50 per beacon.
+- **Android:** fixed TTID/TTFD epoch-timestamp leak in `StartupMetricsTracker` when `startActivityTracking()` is skipped (lifecycle race); now emits sentinel `0` instead of raw epoch.
+- **iOS:** `hangCount` capped at 200 in `iOSHealthTracker` to prevent unbounded growth on sessions with sustained main-thread pressure.
+
 ## 1.2.23
 
 **Critical fix.** Resolves `MissingPluginException` affecting v1.2.19 through
