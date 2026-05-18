@@ -10,9 +10,13 @@ import 'orion_sampling_manager.dart';
 /// SamplingManager.instance.isTrackingEnabled is false, so no frame callbacks
 /// are registered and no memory is allocated for frame data.
 ///
-/// Memory cap: _allFrames is capped at _maxFrames (2 000 entries ≈ 33 s at
+/// Memory cap: _allFrames is capped at _maxFrames (5 000 entries ≈ 83 s at
 /// 60 fps). Frames beyond the cap are silently dropped so a very long screen
 /// session cannot cause unbounded growth.
+///
+/// Jank cluster cap: at most _maxClusters (50) clusters are retained per
+/// beacon. Selection is by severity score so the most impactful clusters
+/// always survive even when many are detected.
 class OrionFrameMetrics {
   static final Map<String, _FrameTracker> _trackers = {};
 
@@ -81,14 +85,14 @@ class FrameMetricsResult {
   });
 
   factory FrameMetricsResult.empty() => FrameMetricsResult(
-        jankyFrames: 0,
-        frozenFrames: 0,
-        totalFrames: 0,
-        avgFrameDuration: 0.0,
-        worstFrameDuration: 0.0,
-        top10Clusters: [],
-        frozenFramesList: [],
-      );
+    jankyFrames: 0,
+    frozenFrames: 0,
+    totalFrames: 0,
+    avgFrameDuration: 0.0,
+    worstFrameDuration: 0.0,
+    top10Clusters: [],
+    frozenFramesList: [],
+  );
 
   Map<String, dynamic> toBeacon() {
     return {
@@ -135,17 +139,17 @@ class JankCluster {
   });
 
   Map<String, dynamic> toBeacon() => {
-        'id':          id,
-        'sfrm':        startFrame,
-        'efrm':        endFrame,
-        'st':          startTime,
-        'et':          endTime,
-        'stEp':        startEpoch,
-        'etEp':        endEpoch,
-        'avgDur':      avgDuration.toStringAsFixed(2),
-        'worstFrmDur': worstDuration.toStringAsFixed(2),
-        'phase':       buildPhase,
-      };
+    'id':          id,
+    'sfrm':        startFrame,
+    'efrm':        endFrame,
+    'st':          startTime,
+    'et':          endTime,
+    'stEp':        startEpoch,
+    'etEp':        endEpoch,
+    'avgDur':      avgDuration.toStringAsFixed(2),
+    'worstFrmDur': worstDuration.toStringAsFixed(2),
+    'phase':       buildPhase,
+  };
 
   int get frameCount => endFrame - startFrame + 1;
 }
@@ -166,12 +170,12 @@ class FrozenFrame {
   });
 
   Map<String, dynamic> toBeacon() => {
-        'frm':   frameNumber,
-        'ts':    timestamp,
-        'ep':    epoch,
-        'dur':   duration.toStringAsFixed(2),
-        'phase': buildPhase,
-      };
+    'frm':   frameNumber,
+    'ts':    timestamp,
+    'ep':    epoch,
+    'dur':   duration.toStringAsFixed(2),
+    'phase': buildPhase,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,10 +208,16 @@ class _FrameTracker {
   final List<_FrameTimestamp> _allFrames   = [];
   final List<FrozenFrame>     _frozenFrames = [];
 
-  // ✅ Memory cap: at 60 fps, 2 000 frames ≈ 33 seconds of tracking.
+  // ✅ Memory cap: at 60 fps, 5 000 frames ≈ 83 seconds of tracking.
   // Frames beyond this limit are silently dropped so a long session
   // never causes unbounded list growth.
-  static const int _maxFrames = 2000;
+  static const int _maxFrames = 5000;
+
+  // ✅ Cluster cap: at most _maxClusters jank clusters are emitted per
+  // beacon, selected by severity score. Bumped from 10 to 50 in 1.2.24 to
+  // give heavy/long-dwell screens more diagnostic visibility while still
+  // bounding beacon size.
+  static const int _maxClusters = 50;
 
   final Stopwatch _stopwatch = Stopwatch();
   int? _lastFrameTime;
@@ -316,19 +326,19 @@ class _FrameTracker {
       final avgDuration = _allFrames.isEmpty
           ? 0.0
           : _allFrames.map((f) => f.duration).reduce((a, b) => a + b) /
-              _allFrames.length;
+          _allFrames.length;
 
       final worstDuration = _allFrames.isEmpty
           ? 0.0
           : _allFrames.map((f) => f.duration).reduce((a, b) => a > b ? a : b);
 
       final allClusters  = _detectJankClusters();
-      final top10Clusters = _selectTop10Clusters(allClusters);
+      final top10Clusters = _selectTopClusters(allClusters);
 
       if (kDebugMode) {
         orionPrint(
           '📊 [$screenName] Frames: $totalFrames total, $jankyFrames janky, '
-          '$frozenFramesCount frozen, avg=${avgDuration.toStringAsFixed(2)}ms',
+              '$frozenFramesCount frozen, avg=${avgDuration.toStringAsFixed(2)}ms',
         );
       }
 
@@ -403,9 +413,9 @@ class _FrameTracker {
     return (avgDuration * 0.3) + (worstDuration * 0.4) + (frameCount * 5.0) + earlyBonus;
   }
 
-  List<JankCluster> _selectTop10Clusters(List<JankCluster> all) {
+  List<JankCluster> _selectTopClusters(List<JankCluster> all) {
     all.sort((a, b) => b.severityScore.compareTo(a.severityScore));
-    return all.take(10).toList();
+    return all.take(_maxClusters).toList();
   }
 
   String _getMostCommon(List<String> items) {

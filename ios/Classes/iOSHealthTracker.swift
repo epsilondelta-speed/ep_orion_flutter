@@ -21,6 +21,16 @@ final class iOSHealthTracker {
     static let shared = iOSHealthTracker()
     private init() {}
 
+    // MARK: - Constants
+
+    // ✅ 1.2.24: cap on hangCount to prevent unbounded growth on long sessions
+    // with persistent main-thread pressure. At the 250ms ping interval, a 0.5s
+    // hang threshold means hangCount can grow ~2/second worst-case — 200
+    // corresponds to ~100 seconds of continuous main-thread blockage, well
+    // beyond any session that's still useful to debug from the metric alone.
+    // Bumped from the previous implicit cap (50, observed in 1.2.21 beacons).
+    private let maxHangCount: Int = 200
+
     // MARK: - State
     private var memoryWarningCount: Int  = 0
     private var hangCount:          Int  = 0
@@ -105,10 +115,19 @@ final class iOSHealthTracker {
             let gap = Date().timeIntervalSince(lastPing)
             if gap > hangThreshold {
                 self.lock.lock()
-                self.hangCount += 1
-                let count = self.hangCount
-                self.lock.unlock()
-                OrionLogger.debug("iOSHealthTracker: ⚠️ Main thread hang (\(Int(gap * 1000))ms) #\(count)")
+                // ✅ 1.2.24: cap the counter at maxHangCount. Past the cap we
+                // also skip the log line to avoid spamming logs on heavy
+                // main-thread pressure sessions. The ping code below MUST
+                // still run regardless — skipping it would cause every
+                // subsequent tick to falsely detect a hang.
+                if self.hangCount < self.maxHangCount {
+                    self.hangCount += 1
+                    let count = self.hangCount
+                    self.lock.unlock()
+                    OrionLogger.debug("iOSHealthTracker: ⚠️ Main thread hang (\(Int(gap * 1000))ms) #\(count)")
+                } else {
+                    self.lock.unlock()
+                }
             }
 
             // Ping the main thread — write under pingLock.
