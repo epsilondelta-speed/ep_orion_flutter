@@ -217,9 +217,20 @@ class OrionRageClickTracker {
     }
   }
 
-  /// Detect if current tap history contains a rage click
+  /// Detect if current tap history contains a rage click.
+  ///
+  /// ✅ Performance fix: previously called _tapHistory.toList() on every
+  /// non-cooldown tap, allocating a new List<_TapEvent> of up to
+  /// _maxHistorySize elements each time. Under heavy tapping (10+ taps/sec)
+  /// this created continuous GC pressure. Also allocated a separate
+  /// clusterTaps list and two reduce() closures per candidate detection.
+  ///
+  /// Now iterates the Queue directly (no copy) and computes centroid +
+  /// time range in a single pass with no intermediate allocations.
+  /// Queue.last is O(1) on Dart's doubly-linked Queue — no list needed
+  /// just to get the anchor tap.
   bool _detectRageClick(int now) {
-    // Cooldown check - avoid detecting same rage click multiple times
+    // Cooldown check — avoid detecting same rage click multiple times
     if (now - _lastRageClickTime < _detectionCooldownMs) {
       return false;
     }
@@ -229,83 +240,75 @@ class OrionRageClickTracker {
       return false;
     }
 
-    // Find clusters of taps within radius
-    final taps = _tapHistory.toList();
+    // ✅ Queue.last is O(1) — no need to copy to a List just for .last
+    final anchor = _tapHistory.last;
 
-    // Check if recent taps form a cluster
-    // Use the most recent tap as anchor
-    final anchor = taps.last;
-    final clusterTaps = <_TapEvent>[];
+    // ✅ Single pass over the Queue — no toList() copy, no clusterTaps list,
+    //    no reduce() closures. Computes count, centroid, and time range
+    //    in one traversal.
+    double sumX = 0, sumY = 0;
+    int clusterCount = 0;
+    int minTs = anchor.timestamp;
+    int maxTs = anchor.timestamp;
 
-    for (final tap in taps) {
-      final distance = _distance(anchor.x, anchor.y, tap.x, tap.y);
-      if (distance <= _config.radiusDp) {
-        clusterTaps.add(tap);
+    for (final tap in _tapHistory) {
+      final dist = _distance(anchor.x, anchor.y, tap.x, tap.y);
+      if (dist <= _config.radiusDp) {
+        sumX += tap.x;
+        sumY += tap.y;
+        clusterCount++;
+        if (tap.timestamp < minTs) minTs = tap.timestamp;
+        if (tap.timestamp > maxTs) maxTs = tap.timestamp;
       }
     }
 
     // Check if cluster qualifies as rage click
-    if (clusterTaps.length >= _config.minTapCount) {
-      // Calculate cluster center
-      double sumX = 0, sumY = 0;
-      for (final tap in clusterTaps) {
-        sumX += tap.x;
-        sumY += tap.y;
-      }
-      final centerX = sumX / clusterTaps.length;
-      final centerY = sumY / clusterTaps.length;
-
-      // Calculate duration
-      final firstTap = clusterTaps.reduce((a, b) =>
-      a.timestamp < b.timestamp ? a : b);
-      final lastTap = clusterTaps.reduce((a, b) =>
-      a.timestamp > b.timestamp ? a : b);
-      final duration = lastTap.timestamp - firstTap.timestamp;
-
-      // Create rage click
-      final rageClick = RageClick(
-        x: centerX,
-        y: centerY,
-        count: clusterTaps.length,
-        durationMs: duration,
-        timestamp: now,
-      );
-
-      // Store for current screen
-      final screen = _currentScreen ?? 'Unknown';
-
-      // ✅ Fix #17: enforce max-rage-clicks-per-screen bound.
-      //    The same defensive pattern as OrionNetworkTracker — a screen with
-      //    extreme tap activity (or one that's never finalised) can't grow
-      //    its rage click list unboundedly.
-      if (!_screenRageClicks.containsKey(screen) &&
-          _screenRageClicks.length >= _maxScreens) {
-        final oldestKey = _screenRageClicks.keys.first;
-        _screenRageClicks.remove(oldestKey);
-        _log('Max screens limit ($_maxScreens) reached, evicted: $oldestKey');
-      }
-
-      final clicks = _screenRageClicks.putIfAbsent(screen, () => []);
-      if (clicks.length >= _maxRageClicksPerScreen) {
-        _log('Max rage clicks per screen ($_maxRageClicksPerScreen) reached '
-            'for $screen, dropping new detection');
-      } else {
-        clicks.add(rageClick);
-      }
-
-      // Update last detection time
-      _lastRageClickTime = now;
-
-      // Clear tap history to avoid re-detection
-      _tapHistory.clear();
-
-      _log('🔴 Rage click detected on $screen: ${clusterTaps.length} taps '
-          'in ${duration}ms at (${centerX.round()}, ${centerY.round()})');
-
-      return true;
+    if (clusterCount < _config.minTapCount) {
+      return false;
     }
 
-    return false;
+    final centerX = sumX / clusterCount;
+    final centerY = sumY / clusterCount;
+    final duration = maxTs - minTs;
+
+    // Create rage click
+    final rageClick = RageClick(
+      x: centerX,
+      y: centerY,
+      count: clusterCount,
+      durationMs: duration,
+      timestamp: now,
+    );
+
+    // Store for current screen
+    final screen = _currentScreen ?? 'Unknown';
+
+    // ✅ Fix #17: enforce max-rage-clicks-per-screen bound.
+    if (!_screenRageClicks.containsKey(screen) &&
+        _screenRageClicks.length >= _maxScreens) {
+      final oldestKey = _screenRageClicks.keys.first;
+      _screenRageClicks.remove(oldestKey);
+      _log('Max screens limit ($_maxScreens) reached, evicted: $oldestKey');
+    }
+
+    final clicks = _screenRageClicks.putIfAbsent(screen, () => []);
+    if (clicks.length >= _maxRageClicksPerScreen) {
+      _log('Max rage clicks per screen ($_maxRageClicksPerScreen) reached '
+          'for $screen, dropping new detection');
+    } else {
+      clicks.add(rageClick);
+    }
+
+    // Update last detection time
+    _lastRageClickTime = now;
+
+    // Clear tap history to avoid re-detection
+    _tapHistory.clear();
+
+    _log('🔴 Rage click detected on $screen: $clusterCount taps '
+        'in ${duration}ms at (${centerX.round()}, ${centerY.round()})');
+
+    return true;
   }
 
   /// Calculate distance between two points

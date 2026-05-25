@@ -1,10 +1,11 @@
 import 'package:flutter/material.dart';
+import 'orion_logger.dart';
 import 'orion_rage_click_tracker.dart';
 
 /// Widget wrapper that detects rage clicks across the entire app.
-/// 
+///
 /// Wrap your MaterialApp or root widget with this to enable rage click tracking:
-/// 
+///
 /// ```dart
 /// OrionRageClickDetector(
 ///   child: MaterialApp(
@@ -12,9 +13,9 @@ import 'orion_rage_click_tracker.dart';
 ///   ),
 /// )
 /// ```
-/// 
+///
 /// Or with custom configuration:
-/// 
+///
 /// ```dart
 /// OrionRageClickDetector(
 ///   config: RageClickConfig(
@@ -57,10 +58,17 @@ class _OrionRageClickDetectorState extends State<OrionRageClickDetector> {
   Offset? _lastRageClickPosition;
   bool _showOverlay = false;
 
+  /// Circuit breaker: if our own detection code ever throws unexpectedly,
+  /// flip this flag and become a transparent no-op for all future taps.
+  /// This prevents any Orion bug from affecting the host app's gesture
+  /// pipeline. The flag is per-widget-instance, so a hot-reload or widget
+  /// rebuild clears it.
+  bool _circuitBroken = false;
+
   @override
   void initState() {
     super.initState();
-    
+
     // Apply configuration if provided
     if (widget.config != null) {
       OrionRageClickTracker.configure(widget.config!);
@@ -70,7 +78,7 @@ class _OrionRageClickDetectorState extends State<OrionRageClickDetector> {
   @override
   void didUpdateWidget(OrionRageClickDetector oldWidget) {
     super.didUpdateWidget(oldWidget);
-    
+
     // Update configuration if changed
     if (widget.config != oldWidget.config && widget.config != null) {
       OrionRageClickTracker.configure(widget.config!);
@@ -78,28 +86,44 @@ class _OrionRageClickDetectorState extends State<OrionRageClickDetector> {
   }
 
   void _handlePointerDown(PointerDownEvent event) {
-    // Record tap at logical pixel position
-    final detected = OrionRageClickTracker.recordTap(
-      event.localPosition.dx,
-      event.localPosition.dy,
-    );
+    // ✅ Circuit breaker: any prior exception in our detection code makes
+    //    all future taps instant no-ops — zero overhead on the gesture path.
+    if (_circuitBroken) return;
 
-    if (detected) {
-      // Get the detected rage click
-      final screen = OrionRageClickTracker.currentScreen ?? 'Unknown';
-      final clicks = OrionRageClickTracker.getRageClicksForScreen(screen);
-      
-      if (clicks.isNotEmpty) {
-        final latestClick = clicks.last;
-        
-        // Call callback if provided
-        widget.onRageClick?.call(latestClick);
+    try {
+      final detected = OrionRageClickTracker.recordTap(
+        event.localPosition.dx,
+        event.localPosition.dy,
+      );
 
-        // Show debug overlay if enabled
-        if (widget.showDebugOverlay) {
-          _showRageClickOverlay(event.localPosition);
+      if (detected) {
+        final screen = OrionRageClickTracker.currentScreen ?? 'Unknown';
+        final clicks = OrionRageClickTracker.getRageClicksForScreen(screen);
+
+        if (clicks.isNotEmpty) {
+          final latestClick = clicks.last;
+
+          // ✅ Guard the customer callback in its own try-catch.
+          //    If their onRageClick throws, that's their bug — log it and
+          //    continue rather than propagating it into our circuit breaker
+          //    or up into Flutter's gesture pipeline.
+          try {
+            widget.onRageClick?.call(latestClick);
+          } catch (e) {
+            orionPrint('[OrionRageClick] onRageClick callback threw: $e');
+          }
+
+          if (widget.showDebugOverlay) {
+            _showRageClickOverlay(event.localPosition);
+          }
         }
       }
+    } catch (e) {
+      // ✅ Unexpected exception in our own detection logic: break the circuit.
+      //    Future taps bail out at the top of this method — no further work.
+      _circuitBroken = true;
+      orionPrint('[OrionRageClick] circuit broken, rage click tracking '
+          'disabled for this instance: $e');
     }
   }
 

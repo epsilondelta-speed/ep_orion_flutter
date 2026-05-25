@@ -21,13 +21,13 @@ import CryptoKit
 ///    thread).  batteryPercent() now returns the value cached by
 ///    BatteryMetricsTracker, which updates via main-thread notifications.
 ///
-/// 3. sdkReleaseName (Fix iOS-1): no longer hardcoded to "1.0.8".  This caused
-///    beacon["releaseName"] and beacon["libVer"] to disagree — releaseName
-///    came from this stale string while libVer came from OrionConfig.sdkVersion
-///    (bundle lookup). Both fields are meant to report the SDK version, so
-///    they must agree. We now compute the default from the same bundle source
-///    used by OrionConfig.sdkVersion. Kept as `var` so test code or future
-///    overrides can still mutate it.
+/// 3. osVersionString / releaseName (1.2.25 fix, previously sdkReleaseName):
+///    releaseName was incorrectly set to OrionConfig.sdkVersion. The aggregation
+///    pipeline maps releaseName → os in the DB, so it must carry the iOS OS
+///    version string (UIDevice.current.systemVersion) to match Android's semantics
+///    and keep the `os` field meaningful for version slicing in dashboards.
+///    libVer (set by SendData.appendCommonFields) remains the correct carrier
+///    for the SDK version. The two must NOT share the same source.
 final class AppMetrics {
 
     // MARK: - Singleton
@@ -40,12 +40,21 @@ final class AppMetrics {
     var projectId:  String = ""
     var appVersion: String = ""
 
-    /// SDK release version reported in `releaseName` field.
+    /// iOS OS version string reported in the `releaseName` field.
     ///
-    /// Default value is derived from the SDK bundle's CFBundleShortVersionString
-    /// (same source as OrionConfig.sdkVersion / `libVer`) so the two fields
-    /// stay in sync. Mutable so tests / future overrides can replace it.
-    var sdkReleaseName: String = OrionConfig.sdkVersion
+    /// The aggregation pipeline maps `releaseName` → `os` in the database,
+    /// so this must be the device OS version (e.g. "17.5.1"), NOT the SDK
+    /// version. On Android, `releaseName` carries the Android OS version
+    /// ("13", "14", etc.); iOS must match that semantics for cross-platform
+    /// `os` field consistency.
+    ///
+    /// Note: `libVer` (set by SendData.appendCommonFields) is the separate
+    /// field that carries the SDK version. The two must NOT be the same source.
+    ///
+    /// 1.2.25 fix: previously this was set to OrionConfig.sdkVersion, which
+    /// caused the aggregation pipeline to write the SDK version string into
+    /// the `os` DB field, breaking iOS version slicing in dashboards.
+    var osVersionString: String = UIDevice.current.systemVersion
 
     private var iOSVersion: Int {
         return Int(UIDevice.current.systemVersion.split(separator: ".").first ?? "16") ?? 16
@@ -84,7 +93,7 @@ final class AppMetrics {
             "appVer":           appVersion,
             "appPkgName":       bundleId(),
             "sdkVer":           iOSVersion,
-            "releaseName":      sdkReleaseName,
+            "releaseName":      osVersionString,
 
             // Screen
             "screenResolution": "\(deviceWidthPx)x\(deviceHeightPx)",
