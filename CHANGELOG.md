@@ -1,3 +1,9 @@
+## 1.2.25
+
+iOS os field fix (P0): The os field was incorrectly reporting the SDK version (e.g. "1.2.25") instead of the device iOS version (e.g. "17.5.1"), breaking iOS version slicing in dashboards for all 1.2.24 customers. Fixed in AppMetrics.swift.
+Memory growthPerHour extrapolation guard: Short sessions (under 5 min) were producing nonsensical values like 3000+ MB/hr due to a 36-second window threshold. Both Android and iOS trackers now require at least 5 minutes of session time and 10 samples before computing the hourly projection; otherwise the field emits 0.
+Dart rage click safety and performance: Added a circuit breaker to OrionRageClickDetector so any unexpected detection error disables future tracking silently 
+
 ## 1.2.24
 
 - **Dart:** frame cap raised 2,000 → 5,000 (~33 s → ~83 s tracking window); jank cluster cap raised 10 → 50 per beacon.
