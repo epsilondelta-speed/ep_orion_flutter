@@ -21,7 +21,15 @@ final class MemoryMetricsTracker {
 
     // MARK: - Constants
     private let tag            = "MemoryMetrics"
-    private let minDurationMs: Double = 36_000
+    /// Minimum session duration before growthPerHour is computed.
+    /// 36 s (the old threshold) produced nonsensical extrapolations on short
+    /// screens — a 2-minute session with 5 samples was yielding 3000+ MB/hr.
+    /// 5 minutes gives enough signal for a meaningful hourly projection.
+    private let minDurationMs: Double = 300_000   // 5 minutes
+    /// Minimum sample count before growthPerHour is computed.
+    /// Paired with minDurationMs: even a 5-minute session with only 2 samples
+    /// (e.g. sparse screen transitions) is unreliable for extrapolation.
+    private let minSamples:    Int    = 10
     private let sessionTimeoutMs: Double = 30 * 60 * 1000
     private let maxSamples     = 100
 
@@ -116,7 +124,11 @@ final class MemoryMetricsTracker {
 
         let durationMs = nowMs() - startTime
         let hours      = durationMs / 3_600_000.0
-        let growthPerHour: Double = (durationMs > minDurationMs && hours > 0)
+        // ✅ Guard: only extrapolate to hourly rate when we have enough data.
+        //    Requires both a long enough window (≥5 min) AND enough samples
+        //    (≥10) to produce a meaningful projection. Short windows produced
+        //    wildly inflated values (e.g. 3000+ MB/hr from a 2-min session).
+        let growthPerHour: Double = (durationMs > minDurationMs && hours > 0 && samples >= minSamples)
             ? growthMB / hours
             : 0.0
 
