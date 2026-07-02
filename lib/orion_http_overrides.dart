@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'orion_network_tracker.dart';
 import 'orion_sampling_manager.dart';
+import 'orion_cold_start.dart';
 
 /// OrionHttpOverrides — Global HTTP interceptor for Orion SDK.
 /// Intercepts ALL dart:io HTTP requests including cached_network_image.
@@ -246,6 +247,9 @@ class _OrionHttpClientRequest implements HttpClientRequest {
         'payloadSize': contentLength > 0 ? contentLength : null,
         'contentType': _inferContentType(trackedUrl),
       });
+      // Cold-start (1.2.26): candidate first network response. Self-filters
+      // Orion hosts and self-disarms — a single bool check after first hit.
+      OrionColdStart.maybeMarkFirstNetwork(trackedUrl);
     } catch (_) {}
   }
 

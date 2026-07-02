@@ -10,9 +10,11 @@ import 'orion_sampling_manager.dart';
 /// SamplingManager.instance.isTrackingEnabled is false, so no frame callbacks
 /// are registered and no memory is allocated for frame data.
 ///
-/// Memory cap: _allFrames is capped at _maxFrames (5 000 entries ≈ 83 s at
-/// 60 fps). Frames beyond the cap are silently dropped so a very long screen
-/// session cannot cause unbounded growth.
+/// Memory cap: _allFrames is capped at a refresh-rate-aware limit — 600 frames
+/// on 60 Hz devices (~10 s) and 1000 on >60 Hz devices (so high-refresh screens
+/// get a comparable time window rather than a much shorter one). Frames beyond
+/// the cap are silently dropped so a very long screen session cannot cause
+/// unbounded growth. Lowered from a flat 5 000 in 1.2.26.
 ///
 /// Jank cluster cap: at most _maxClusters (50) clusters are retained per
 /// beacon. Selection is by severity score so the most impactful clusters
@@ -208,10 +210,20 @@ class _FrameTracker {
   final List<_FrameTimestamp> _allFrames   = [];
   final List<FrozenFrame>     _frozenFrames = [];
 
-  // ✅ Memory cap: at 60 fps, 5 000 frames ≈ 83 seconds of tracking.
-  // Frames beyond this limit are silently dropped so a long session
-  // never causes unbounded list growth.
-  static const int _maxFrames = 5000;
+  // ✅ Memory cap: bounds the retained per-frame buffer so a long session
+  // never causes unbounded list growth. The cap is refresh-rate aware:
+  //   - 60 Hz devices  → 600 frames  (~10 s of tracking)
+  //   - >60 Hz devices → 1000 frames (~10 s at 90 Hz, ~8.3 s at 120 Hz)
+  // A fixed frame count would give high-refresh devices a much shorter time
+  // window (600 frames = only 5 s at 120 Hz), so we raise the cap on those
+  // devices to keep the captured *duration* roughly comparable. Resolved once
+  // in start() from the device refresh rate. Lowered from a flat 5000 in
+  // 1.2.26 — the retained frames only feed summary metrics and contiguous
+  // jank-cluster detection, neither of which needs a long history.
+  static const int _maxFrames60Hz   = 600;
+  static const int _maxFramesHighHz  = 1000;
+  static const double _highRefreshThreshold = 61.0; // Hz; >60 counts as high-refresh
+  int _maxFrames = _maxFrames60Hz; // resolved in start()
 
   // ✅ Cluster cap: at most _maxClusters jank clusters are emitted per
   // beacon, selected by severity score. Bumped from 10 to 50 in 1.2.24 to
@@ -233,8 +245,28 @@ class _FrameTracker {
     _isTracking           = true;
     _lastFrameTime        = null;
     _navigationStartEpoch = DateTime.now().millisecondsSinceEpoch;
+    _maxFrames            = _resolveMaxFrames();
     _stopwatch.start();
     _scheduleNextFrame();
+  }
+
+  /// Resolve the frame cap from the device's refresh rate.
+  /// Falls back to the 60 Hz cap if the rate can't be determined.
+  int _resolveMaxFrames() {
+    try {
+      // PlatformDispatcher.displays is available on modern Flutter. The
+      // primary display's refreshRate is in Hz (e.g. 60.0, 90.0, 120.0).
+      final displays = PlatformDispatcher.instance.displays;
+      if (displays.isNotEmpty) {
+        final hz = displays.first.refreshRate;
+        if (hz >= _highRefreshThreshold) {
+          return _maxFramesHighHz;
+        }
+      }
+    } catch (_) {
+      // Any failure (older Flutter, no display info) → safe default.
+    }
+    return _maxFrames60Hz;
   }
 
   void stop() {

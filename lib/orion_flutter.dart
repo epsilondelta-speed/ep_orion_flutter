@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'orion_flutter_platform_interface.dart';
 import 'orion_sampling_manager.dart';
 import 'orion_http_overrides.dart';
+import 'orion_cold_start.dart';
 
 export 'orion_wake_lock.dart';
 export 'orion_rage_click_tracker.dart';
@@ -43,6 +44,10 @@ class OrionFlutter {
       }
 
       SamplingManager.instance.initialize(cid, pid, sampleRate: sampleRate);
+
+      // Cold-start (1.2.26): arm the one-shot first-frame mark. Android-only
+      // internally; a no-op on iOS and safe if the binding isn't ready.
+      OrionColdStart.armFirstFrameMark();
 
       return await _channel.invokeMethod<String>('initializeEdOrion', {
         'cid': cid,

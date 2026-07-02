@@ -23,6 +23,7 @@ import 'package:orion_flutter/orion_network_tracker.dart';
 import 'package:orion_flutter/orion_logger.dart';
 import 'orion_flutter.dart';
 import 'orion_sampling_manager.dart';
+import 'orion_cold_start.dart';
 
 class OrionDioInterceptor extends Interceptor {
 
@@ -179,6 +180,9 @@ class OrionDioInterceptor extends Interceptor {
         'errorMessage': error,
         'actualTime':   actualTime,
       });
+      // Cold-start (1.2.26): candidate first network response. Self-filters
+      // Orion hosts and self-disarms — a single bool check after first hit.
+      OrionColdStart.maybeMarkFirstNetwork(options.uri.toString());
     } catch (e) {
       orionPrint('⚠️ [Orion] _trackRequest error (ignored): $e');
     }

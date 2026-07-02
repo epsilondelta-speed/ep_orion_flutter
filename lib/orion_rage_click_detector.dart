@@ -143,12 +143,39 @@ class _OrionRageClickDetectorState extends State<OrionRageClickDetector> {
     });
   }
 
+  /// Feed depth-0 (outermost scrollable) scroll positions to the tracker.
+  ///
+  /// ScrollNotifications bubble up from every descendant scrollable, so this
+  /// captures scroll state app-wide with zero client integration. depth == 0
+  /// filters out nested scrollables (e.g. a horizontal carousel inside a
+  /// vertical list) so the offset always reflects the page-level scroll.
+  ///
+  /// Only vertical axis is tracked for v1 — vertical scroll dominates the
+  /// "content moved under the tap position" problem on listing/detail pages.
+  bool _onScrollNotification(ScrollNotification notification) {
+    try {
+      if (notification.depth == 0 &&
+          notification.metrics.axis == Axis.vertical) {
+        OrionRageClickTracker.updateScrollOffset(
+          notification.metrics.pixels,
+          notification.metrics.maxScrollExtent,
+        );
+      }
+    } catch (_) {
+      // Never let scroll observation interfere with the app's scrolling.
+    }
+    return false; // don't consume — let the notification keep bubbling
+  }
+
   @override
   Widget build(BuildContext context) {
-    Widget child = Listener(
-      behavior: HitTestBehavior.translucent,
-      onPointerDown: _handlePointerDown,
-      child: widget.child,
+    Widget child = NotificationListener<ScrollNotification>(
+      onNotification: _onScrollNotification,
+      child: Listener(
+        behavior: HitTestBehavior.translucent,
+        onPointerDown: _handlePointerDown,
+        child: widget.child,
+      ),
     );
 
     // Add debug overlay if enabled
