@@ -18,12 +18,29 @@ class RageClick {
   final int durationMs;
   final int timestamp;
 
+  /// Vertical scroll offset (px) of the primary scrollable at detection time.
+  /// 0 when the page hadn't been scrolled (or has no scrollable).
+  final double scrollY;
+
+  /// Max vertical scroll extent (px) of the primary scrollable at detection
+  /// time. 0 when unknown / no scrollable. Lets the dashboard compute scroll
+  /// depth: scrollY / (maxScrollY == 0 ? 1 : maxScrollY).
+  final double maxScrollY;
+
+  /// Content-space Y: viewport y + scrollY. Two rage clicks at the same
+  /// glass position but different scroll depths get different contentY,
+  /// so the dashboard can build a full-page heatmap instead of collapsing
+  /// unrelated taps into the same viewport cell.
+  double get contentY => y + scrollY;
+
   RageClick({
     required this.x,
     required this.y,
     required this.count,
     required this.durationMs,
     required this.timestamp,
+    this.scrollY = 0.0,
+    this.maxScrollY = 0.0,
   });
 
   Map<String, dynamic> toJson() => {
@@ -32,6 +49,16 @@ class RageClick {
     'count': count,
     'durMs': durationMs,
     'ts': timestamp,
+    // Scroll context (1.2.26+). All three fields are gated together on
+    // scrollY > 0: if the user hasn't scrolled, none appear, keeping
+    // unscrolled pages byte-identical to 1.2.25. (Previously msy was gated
+    // independently on maxScrollY > 0, so a scrollable page tapped at the
+    // top emitted a lone, meaningless "msy" with no sy/cy.)
+    if (scrollY > 0) ...{
+      'sy': scrollY.round(),
+      'msy': maxScrollY.round(),
+      'cy': contentY.round(),
+    },
   };
 }
 
@@ -126,6 +153,22 @@ class OrionRageClickTracker {
   static const int _maxScreens               = 50;
   static const int _maxRageClicksPerScreen   = 50;
 
+  // ─── Scroll context (1.2.26) ───────────────────────────────────────────
+  // Latest vertical scroll position of the primary (depth-0) scrollable,
+  // fed by OrionRageClickDetector's NotificationListener. Used to stamp
+  // each detected rage click with the scroll offset at detection time so
+  // dashboards can distinguish taps on different content that happen to
+  // share the same viewport position.
+  double _currentScrollY    = 0.0;
+  double _currentMaxScrollY = 0.0;
+
+  /// Update the current scroll position. Called by the detector on every
+  /// depth-0 ScrollNotification. Resets to 0 on screen change.
+  static void updateScrollOffset(double pixels, double maxExtent) {
+    instance._currentScrollY    = pixels < 0 ? 0.0 : pixels;
+    instance._currentMaxScrollY = maxExtent < 0 ? 0.0 : maxExtent;
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // Configuration
   // ═══════════════════════════════════════════════════════════════════════════
@@ -161,6 +204,12 @@ class OrionRageClickTracker {
   static void setCurrentScreen(String screenName) {
     final inst = instance;
     inst._currentScreen = screenName;
+
+    // ✅ New screen starts unscrolled — reset scroll context so a rage click
+    //    on the new screen before any scroll isn't stamped with the previous
+    //    screen's offset.
+    inst._currentScrollY    = 0.0;
+    inst._currentMaxScrollY = 0.0;
 
     // ✅ Fix #17: enforce max-screens bound. If the map already has
     //    _maxScreens entries and this is a new key, drop the oldest entry
@@ -271,13 +320,17 @@ class OrionRageClickTracker {
     final centerY = sumY / clusterCount;
     final duration = maxTs - minTs;
 
-    // Create rage click
+    // Create rage click — stamped with the scroll position at detection
+    // time. Taps in a rage cluster span <1 s, so a single offset snapshot
+    // is representative for the whole cluster.
     final rageClick = RageClick(
       x: centerX,
       y: centerY,
       count: clusterCount,
       durationMs: duration,
       timestamp: now,
+      scrollY: _currentScrollY,
+      maxScrollY: _currentMaxScrollY,
     );
 
     // Store for current screen
@@ -346,6 +399,8 @@ class OrionRageClickTracker {
     instance._tapHistory.clear();
     instance._screenRageClicks.clear();
     instance._lastRageClickTime = 0;
+    instance._currentScrollY    = 0.0;
+    instance._currentMaxScrollY = 0.0;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
