@@ -12,6 +12,8 @@ dependencies:
   flutter:
     sdk: flutter
   plugin_platform_interface: ^2.0.2
+  dio: ^5.2.1
+  http: ^1.6.0
 
 dev_dependencies:
   flutter_test:
