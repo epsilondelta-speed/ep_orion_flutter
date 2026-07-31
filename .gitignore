@@ -1,0 +1,13 @@
+# Flutter/Dart generated files
+.dart_tool/
+build/
+
+# Flutter packages
+.packages
+
+# IDE files
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
