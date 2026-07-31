@@ -205,6 +205,13 @@ final class FlutterSendData {
 
     // MARK: - Rage Clicks Array Builder
 
+    /// Rebuilds each rage click for the beacon.
+    ///
+    /// ⚠️ This is a whitelist: any key not explicitly copied here is dropped.
+    /// That is what silently discarded the 1.2.26 scroll-context fields on
+    /// iOS while Android forwarded them — the scroll-aware heatmap feature
+    /// did not work on iOS at all. When the Dart layer adds a rage click
+    /// field, it must be added here too.
     private func buildRageClicksArray(_ clicks: [[String: Any]]) -> [[String: Any]] {
         return clicks.compactMap { click in
             guard
@@ -212,13 +219,33 @@ final class FlutterSendData {
                 let y   = (click["y"]     as? NSNumber)?.intValue,
                 let cnt = (click["count"] as? NSNumber)?.intValue
             else { return nil }
-            return [
+
+            var obj: [String: Any] = [
                 "x":      x,
                 "y":      y,
                 "count":  cnt,
                 "durMs":  (click["durMs"] as? NSNumber)?.intValue ?? 0,
                 "ts":     (click["ts"]    as? NSNumber)?.int64Value ?? 0
             ]
+
+            // Scroll context (1.2.26+): sy = scroll offset at tap time,
+            // msy = max scroll extent, cy = content-space Y (y + sy).
+            //
+            // The Dart tracker emits all three together, and only when the
+            // page was actually scrolled (scrollY > 0). This `if let` chain
+            // preserves that all-three-or-none contract: an unscrolled tap
+            // carries none of them, so the beacon stays byte-identical to
+            // pre-1.2.26 for unscrolled pages and the backend never sees a
+            // lone `msy` with no position to go with it.
+            if let sy  = (click["sy"]  as? NSNumber)?.intValue,
+               let msy = (click["msy"] as? NSNumber)?.intValue,
+               let cy  = (click["cy"]  as? NSNumber)?.intValue {
+                obj["sy"]  = sy
+                obj["msy"] = msy
+                obj["cy"]  = cy
+            }
+
+            return obj
         }
     }
 }
