@@ -1,3 +1,9 @@
+
+## 1.2.27
+
+Reliable iOS crash delivery.
+iOS rage click scroll fields fixed.
+
 ## 1.2.26
 
 cold-start phase improvement (Android), scroll context on
