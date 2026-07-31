@@ -2,7 +2,7 @@ name: orion_flutter
 description: Orion Flutter SDK (binary-only)
 homepage: https://github.com/epsilondelta-speed/ep_orion_flutter
 repository: https://github.com/epsilondelta-speed/ep_orion_flutter
-version: 1.2.26
+version: 1.2.27
 
 environment:
   sdk: ">=3.0.0 <4.0.0"
