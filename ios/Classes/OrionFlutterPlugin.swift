@@ -114,6 +114,12 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
             StartupTypeTracker.shared.detectStartupType()
             iOSSamplingManager.shared.initialize(cid: cid, pid: pid)
 
+            // ✅ 1.2.27: deliver any crash persisted by the PREVIOUS launch.
+            //    Must run AFTER iOSSamplingManager.initialize() above, since
+            //    the crash sampling gate is applied at send time using the
+            //    current config.
+            OrionCrashStore.flushPendingCrash()
+
             // ✅ Chain the crash handler rather than overwriting it.
             //    Libraries like Crashlytics / Sentry install their own handler first.
             //    Overwriting without chaining silently breaks their crash reporting.
@@ -124,7 +130,7 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
             //    is context-free and satisfies the C function pointer requirement.
             OrionFlutterPlugin.previousUncaughtExceptionHandler = NSGetUncaughtExceptionHandler()
             NSSetUncaughtExceptionHandler { exception in
-                // Build and send Orion crash beacon.
+                // Build the Orion crash beacon.
                 var beacon: [String: Any] = [
                     "source":           "ios_native",
                     "crashType":        exception.name.rawValue,
@@ -142,9 +148,17 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
                 for (key, value) in staticMetrics where beacon[key] == nil {
                     beacon[key] = value
                 }
-                // coronaGo with beaconType = "crash" bypasses sampling gate.
-                SendData().coronaGo(beacon)
-                Thread.sleep(forTimeInterval: 0.5)
+
+                // ✅ 1.2.27: persist to disk instead of attempting an async
+                //    network POST here. SendData().coronaGo(...) hands off to
+                //    DispatchQueue.global().async → URLSession.resume(), two
+                //    async hops that iOS almost never completes before it
+                //    tears the process down — which is why iOS crashes showed
+                //    up in Crashlytics but not in Orion. The old
+                //    Thread.sleep(0.5) was an attempt to win that race and has
+                //    been removed. The beacon is now sent by
+                //    OrionCrashStore.flushPendingCrash() on the next launch.
+                OrionCrashStore.persist(beacon)
 
                 // ✅ Forward to the previously installed handler (Crashlytics, Sentry, etc.)
                 OrionFlutterPlugin.previousUncaughtExceptionHandler?(exception)
