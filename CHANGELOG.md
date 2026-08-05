@@ -1,4 +1,9 @@
 
+## 1.2.28
+
+Reliable iOS crash delivery bug fix.
+iOS hang rate fixed.
+
 ## 1.2.27
 
 Reliable iOS crash delivery.
