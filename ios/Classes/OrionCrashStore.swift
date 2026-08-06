@@ -62,9 +62,14 @@ enum OrionCrashStore {
             // .atomic ensures we never leave a half-written file behind if
             // the process dies mid-write.
             try out.write(to: URL(fileURLWithPath: pendingCrashPath), options: .atomic)
+            NSLog("[Orion] CRASH-DIAG persisted \(out.count) bytes to \(pendingCrashPath)")
         } catch {
-            // Never let crash-persistence failure interfere with the crash
-            // path itself — the app is terminating either way.
+            // DIAGNOSTIC (1.2.28): this catch previously swallowed silently,
+            // so a JSON-serialization or write failure was indistinguishable
+            // from the handler never running. Unconditional NSLog because
+            // OrionLogger produces nothing in release builds.
+            NSLog("[Orion] CRASH-DIAG persist FAILED: \(error)")
+            // Still never rethrow — the app is terminating either way.
         }
     }
 

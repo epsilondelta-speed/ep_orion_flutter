@@ -3,45 +3,81 @@ import UIKit
 
 /// iOSHealthTracker — Tracks iOS-specific device health signals.
 ///
-/// Thread-safety fix:
-///   lastMainThreadPing was written from the main thread (via DispatchQueue.main.async)
-///   and read from the background DispatchSourceTimer thread without any
-///   synchronisation — a classic data race on a struct (Date).
-///   Fix: protect lastMainThreadPing with a dedicated NSLock so both reads and
-///   writes are serialised.
+/// Thread-safety:
+///   lastMainThreadPing is written from the main thread (via
+///   DispatchQueue.main.async) and read from the background
+///   DispatchSourceTimer thread, so it is protected by its own NSLock,
+///   separate from the heavier session lock (avoids priority inversion
+///   between the very-frequent ping writes and session reads).
+///
+/// Hang detection (detail added 1.2.28):
+///   A background timer pings the main thread every 250 ms. If the gap since
+///   the last successful ping exceeds 500 ms, the main thread is considered
+///   hung for that interval.
+///
+///   Prior to 1.2.28 only a count was kept — `hangCount: 3` told a developer
+///   the app froze but nothing about where or how badly, which is not
+///   actionable. The tracker now retains per-hang duration, timestamp and the
+///   screen that was showing at the time, and reports aggregates plus the
+///   worst offenders in `hangDetail`.
 ///
 /// False-positive rate:
-///   A 500ms hang threshold is very sensitive — every Flutter frame drop
-///   (Choreographer skipped frames) will count.  The count is still useful as a
-///   session-level heuristic, but callers should interpret it as
-///   "main thread pressure events" rather than true ANR-equivalent hangs.
+///   The 500 ms threshold is sensitive — a dropped-frame burst counts. Read
+///   these as "main thread pressure events" rather than ANR-equivalent hangs.
+///   Use `hangDetail.worstMs` and the bucket distribution to separate ordinary
+///   jank (500 ms–1 s) from genuinely user-visible freezes (2 s+).
 final class iOSHealthTracker {
 
     // MARK: - Singleton
     static let shared = iOSHealthTracker()
     private init() {}
 
-    // MARK: - Constants
+    // MARK: - Tunables
 
-    // ✅ 1.2.24: cap on hangCount to prevent unbounded growth on long sessions
-    // with persistent main-thread pressure. At the 250ms ping interval, a 0.5s
-    // hang threshold means hangCount can grow ~2/second worst-case — 200
-    // corresponds to ~100 seconds of continuous main-thread blockage, well
-    // beyond any session that's still useful to debug from the metric alone.
-    // Bumped from the previous implicit cap (50, observed in 1.2.21 beacons).
-    private let maxHangCount: Int = 200
+    private let pingInterval:  TimeInterval = 0.25
+    private let hangThreshold: TimeInterval = 0.5
+
+    /// Gaps longer than this are treated as app suspension, not a hang.
+    ///
+    /// When iOS suspends a backgrounded process, both the timer and the main
+    /// thread stop. On resume the first tick sees a gap equal to the entire
+    /// background duration, which pre-1.2.28 was counted as a hang — a
+    /// 5-minute background produced a bogus 300,000 ms "hang". Anything above
+    /// this ceiling is discarded, and didBecomeActive also resets the ping
+    /// clock so the first post-resume tick starts fresh.
+    private let suspensionCeiling: TimeInterval = 10.0
+
+    /// Upper bound on retained hang records. Hangs are rare compared to
+    /// frames, so this is generous; when full, a new hang only displaces the
+    /// shortest retained one, keeping the worst offenders.
+    private let maxRetainedHangs = 50
+
+    /// How many hangs are emitted in the beacon (worst first).
+    private let maxReportedHangs = 5
 
     // MARK: - State
+
     private var memoryWarningCount: Int  = 0
     private var hangCount:          Int  = 0
     private var sessionStartTime:   Date = Date()
     private var observers:          [NSObjectProtocol] = []
     private let lock       = NSLock()
 
-    // ✅ Separate lock for the ping timestamp to avoid priority inversion
-    //    between the heavy session lock and the very-frequent ping writes.
     private var lastMainThreadPing: Date = Date()
     private let pingLock = NSLock()
+
+    /// One detected main-thread hang.
+    private struct HangRecord {
+        let durationMs: Int
+        let epochMs:    Int64
+        let screen:     String
+    }
+    private var hangs: [HangRecord] = []
+
+    /// Screen visible when a hang occurs. Written from the main thread by the
+    /// plugin on every screen start, read from the detector's background
+    /// thread — guarded by `lock`.
+    private var currentScreen: String = "UnknownScreen"
 
     // MARK: - Init
 
@@ -50,11 +86,10 @@ final class iOSHealthTracker {
         sessionStartTime   = Date()
         memoryWarningCount = 0
         hangCount          = 0
+        hangs.removeAll()
         lock.unlock()
 
-        pingLock.lock()
-        lastMainThreadPing = Date()
-        pingLock.unlock()
+        resetPingClock()
 
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers.removeAll()
@@ -69,7 +104,7 @@ final class iOSHealthTracker {
             self.memoryWarningCount += 1
             let count = self.memoryWarningCount
             self.lock.unlock()
-            OrionLogger.debug("iOSHealthTracker: ⚠️ Memory warning #\(count)")
+            OrionLogger.debug("iOSHealthTracker: Memory warning #\(count)")
         }
 
         let lpObs = NotificationCenter.default.addObserver(
@@ -77,7 +112,7 @@ final class iOSHealthTracker {
             object:  nil,
             queue:   .main
         ) { _ in
-            OrionLogger.debug("iOSHealthTracker: Low power mode → \(ProcessInfo.processInfo.isLowPowerModeEnabled)")
+            OrionLogger.debug("iOSHealthTracker: Low power mode -> \(ProcessInfo.processInfo.isLowPowerModeEnabled)")
         }
 
         let thermalObs = NotificationCenter.default.addObserver(
@@ -85,12 +120,40 @@ final class iOSHealthTracker {
             object:  nil,
             queue:   .main
         ) { _ in
-            OrionLogger.debug("iOSHealthTracker: Thermal state → \(ProcessInfo.processInfo.thermalState.rawValue)")
+            OrionLogger.debug("iOSHealthTracker: Thermal state -> \(ProcessInfo.processInfo.thermalState.rawValue)")
         }
 
-        observers = [memObs, lpObs, thermalObs]
+        // 1.2.28: reset the ping clock when the app returns to the foreground
+        // so the first tick after resume doesn't measure the background
+        // duration as a hang.
+        let activeObs = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object:  nil,
+            queue:   .main
+        ) { [weak self] _ in
+            self?.resetPingClock()
+        }
+
+        observers = [memObs, lpObs, thermalObs, activeObs]
         startHangDetection()
         OrionLogger.debug("iOSHealthTracker: Initialized")
+    }
+
+    private func resetPingClock() {
+        pingLock.lock()
+        lastMainThreadPing = Date()
+        pingLock.unlock()
+    }
+
+    // MARK: - Screen context
+
+    /// Called by the plugin on every Flutter screen start so hang records can
+    /// name the screen the user was on. Without this a hang report says only
+    /// "the app froze for 2s", which is not actionable.
+    func updateCurrentScreen(_ screen: String) {
+        lock.lock()
+        currentScreen = screen
+        lock.unlock()
     }
 
     // MARK: - Hang Detection
@@ -98,35 +161,24 @@ final class iOSHealthTracker {
     private var hangDetectorTimer: DispatchSourceTimer?
 
     private func startHangDetection() {
-        let pingInterval:  TimeInterval = 0.25
-        let hangThreshold: TimeInterval = 0.5
-
         hangDetectorTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + pingInterval, repeating: pingInterval)
         timer.setEventHandler { [weak self] in
             guard let self = self else { return }
 
-            // ✅ Read last ping timestamp under its own lock — safe from background thread.
             self.pingLock.lock()
             let lastPing = self.lastMainThreadPing
             self.pingLock.unlock()
 
             let gap = Date().timeIntervalSince(lastPing)
-            if gap > hangThreshold {
-                self.lock.lock()
-                // ✅ 1.2.24: cap the counter at maxHangCount. Past the cap we
-                // also skip the log line to avoid spamming logs on heavy
-                // main-thread pressure sessions. The ping code below MUST
-                // still run regardless — skipping it would cause every
-                // subsequent tick to falsely detect a hang.
-                if self.hangCount < self.maxHangCount {
-                    self.hangCount += 1
-                    let count = self.hangCount
-                    self.lock.unlock()
-                    OrionLogger.debug("iOSHealthTracker: ⚠️ Main thread hang (\(Int(gap * 1000))ms) #\(count)")
+
+            if gap > self.hangThreshold {
+                if gap > self.suspensionCeiling {
+                    // App was suspended, not hung — see suspensionCeiling.
+                    OrionLogger.debug("iOSHealthTracker: ignoring \(Int(gap))s gap (app suspension, not a hang)")
                 } else {
-                    self.lock.unlock()
+                    self.recordHang(durationMs: Int(gap * 1000))
                 }
             }
 
@@ -140,6 +192,31 @@ final class iOSHealthTracker {
         }
         timer.resume()
         hangDetectorTimer = timer
+    }
+
+    private func recordHang(durationMs: Int) {
+        lock.lock()
+        hangCount += 1
+        let count  = hangCount
+        let screen = currentScreen
+
+        let record = HangRecord(
+            durationMs: durationMs,
+            epochMs:    Int64(Date().timeIntervalSince1970 * 1000),
+            screen:     screen
+        )
+
+        if hangs.count < maxRetainedHangs {
+            hangs.append(record)
+        } else if let minIdx = hangs.indices.min(by: { hangs[$0].durationMs < hangs[$1].durationMs }),
+                  hangs[minIdx].durationMs < durationMs {
+            // Buffer full — displace the shortest retained hang so the worst
+            // offenders survive.
+            hangs[minIdx] = record
+        }
+        lock.unlock()
+
+        OrionLogger.debug("iOSHealthTracker: Main thread hang (\(durationMs)ms) #\(count) on \(screen)")
     }
 
     // MARK: - Thermal State
@@ -162,17 +239,71 @@ final class iOSHealthTracker {
 
     func getSessionMetrics() -> [String: Any] {
         lock.lock()
-        let memWarn  = memoryWarningCount
-        let hangs    = hangCount
+        let memWarn      = memoryWarningCount
+        let hangsTotal   = hangCount
+        let records      = hangs
+        let sessionStart = sessionStartTime
         lock.unlock()
 
-        return [
+        var out: [String: Any] = [
             "thermalState":     thermalStateString(),
             "thermalLevel":     thermalStateLevel(),
             "lowPowerMode":     ProcessInfo.processInfo.isLowPowerModeEnabled,
             "memPressureCount": memWarn,
-            "hangCount":        hangs,
+            "hangCount":        hangsTotal,          // unchanged — back-compat
             "processorCount":   ProcessInfo.processInfo.activeProcessorCount
+        ]
+
+        // 1.2.28: hang detail. Omitted entirely when no hangs occurred, so
+        // healthy sessions produce a beacon identical in size to 1.2.27.
+        if !records.isEmpty {
+            out["hangDetail"] = buildHangDetail(records, sessionStart: sessionStart)
+        }
+
+        return out
+    }
+
+    private func buildHangDetail(_ records: [HangRecord], sessionStart: Date) -> [String: Any] {
+        let durations = records.map { $0.durationMs }
+        let totalMs   = durations.reduce(0, +)
+        let worstMs   = durations.max() ?? 0
+        let avgMs     = durations.isEmpty ? 0 : totalMs / durations.count
+
+        // Severity buckets — lets a dashboard separate ordinary jank from
+        // user-visible freezes without shipping every raw duration.
+        var small = 0, medium = 0, large = 0, xlarge = 0
+        for d in durations {
+            switch d {
+            case ..<1000:  small  += 1   // 500ms-1s · felt as jank
+            case ..<2000:  medium += 1   // 1-2s     · noticeable stall
+            case ..<5000:  large  += 1   // 2-5s     · user-visible freeze
+            default:       xlarge += 1   // 5s+      · perceived as a hang
+            }
+        }
+
+        // Hang time as a share of session duration — the single best severity
+        // signal, since 3 hangs in 10s is very different from 3 in 10min.
+        let sessionMs = max(1, Int(Date().timeIntervalSince(sessionStart) * 1000))
+        let pct = (Double(totalMs) / Double(sessionMs)) * 100.0
+
+        let top = records
+            .sorted { $0.durationMs > $1.durationMs }
+            .prefix(maxReportedHangs)
+            .map { r -> [String: Any] in
+                [
+                    "durMs":  r.durationMs,
+                    "ts":     r.epochMs,
+                    "screen": r.screen
+                ]
+            }
+
+        return [
+            "totMs":        totalMs,
+            "worstMs":      worstMs,
+            "avgMs":        avgMs,
+            "pctOfSession": (pct * 100).rounded() / 100,   // 2dp
+            "buckets":      ["s": small, "m": medium, "l": large, "xl": xlarge],
+            "top":          Array(top)
         ]
     }
 
@@ -180,8 +311,10 @@ final class iOSHealthTracker {
         lock.lock()
         memoryWarningCount = 0
         hangCount          = 0
+        hangs.removeAll()
         sessionStartTime   = Date()
         lock.unlock()
+        resetPingClock()
     }
 
     func shutdown() {
