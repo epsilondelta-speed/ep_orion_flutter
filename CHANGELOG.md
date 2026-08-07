@@ -1,3 +1,6 @@
+## 1.2.30
+Fixed: iOS hang detector improvement
+
 ## 1.2.29
 iOS fixes new beacon delivery type added
 
