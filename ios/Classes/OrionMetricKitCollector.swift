@@ -155,8 +155,15 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
         // ── 1. Collect raw diagnostics ───────────────────────────────────
         var items: [DiagItem] = []
 
+        // Device/app metadata lives on each MXDiagnostic, not on the payload.
+        // Every diagnostic in one payload comes from the same device and OS,
+        // so the first one seen is representative.
+        var meta: MXMetaData? = nil
+        var diagAppVersion: String? = nil
+
         for d in payload.hangDiagnostics ?? [] {
             guard items.count < maxDiagnosticsPerPayload else { break }
+            if meta == nil { meta = d.metaData; diagAppVersion = d.applicationVersion }
             let ms = Int(d.hangDuration.converted(to: .milliseconds).value)
             items.append(DiagItem(
                 diagType: "hang",
@@ -169,6 +176,7 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
 
         for d in payload.crashDiagnostics ?? [] {
             guard items.count < maxDiagnosticsPerPayload else { break }
+            if meta == nil { meta = d.metaData; diagAppVersion = d.applicationVersion }
             let isWatchdog = Self.isWatchdogTermination(d)
             var extra: [String: Any] = [:]
             if let reason = d.terminationReason { extra["terminationReason"] = reason }
@@ -186,6 +194,7 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
 
         for d in payload.cpuExceptionDiagnostics ?? [] {
             guard items.count < maxDiagnosticsPerPayload else { break }
+            if meta == nil { meta = d.metaData; diagAppVersion = d.applicationVersion }
             items.append(DiagItem(
                 diagType: "cpuException",
                 category: "severe",
@@ -197,6 +206,7 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
 
         for d in payload.diskWriteExceptionDiagnostics ?? [] {
             guard items.count < maxDiagnosticsPerPayload else { break }
+            if meta == nil { meta = d.metaData; diagAppVersion = d.applicationVersion }
             items.append(DiagItem(
                 diagType: "diskWriteException",
                 category: "mild",
@@ -210,7 +220,11 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
 
         // ── 2. Group by signature and emit ONE beacon ────────────────────
         let groups = group(items)
-        send(buildBeacon(groups: groups, totalItems: items.count, payload: payload))
+        send(buildBeacon(groups: groups,
+                         totalItems: items.count,
+                         payload: payload,
+                         meta: meta,
+                         diagAppVersion: diagAppVersion))
 
         OrionLogger.debug("MetricKit: \(items.count) diagnostic(s) -> \(groups.count) group(s), 1 beacon")
     }
@@ -312,7 +326,9 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
 
     private func buildBeacon(groups: [DiagGroup],
                              totalItems: Int,
-                             payload: MXDiagnosticPayload) -> [String: Any] {
+                             payload: MXDiagnosticPayload,
+                             meta: MXMetaData?,
+                             diagAppVersion: String?) -> [String: Any] {
         let kept = Array(groups.prefix(maxGroups))
 
         var beacon: [String: Any] = [
@@ -342,11 +358,14 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
         }
 
         // App/OS version AT THE TIME of the diagnostic — may differ from the
-        // current build if the user updated in between.
-        let meta = payload.metaData
-        beacon["diagAppVer"] = meta.applicationBuildVersion
-        beacon["diagOsVer"]  = meta.osVersion
-        beacon["diagDevice"] = meta.deviceType
+        // current build if the user updated in between. Sourced from the
+        // MXDiagnostic (MXDiagnosticPayload itself carries no metaData).
+        if let m = meta {
+            beacon["diagBuild"]  = m.applicationBuildVersion
+            beacon["diagOsVer"]  = m.osVersion
+            beacon["diagDevice"] = m.deviceType
+        }
+        if let v = diagAppVersion { beacon["diagAppVer"] = v }
 
         beacon["diagnostics"] = kept.map { g -> [String: Any] in
             var d: [String: Any] = [
