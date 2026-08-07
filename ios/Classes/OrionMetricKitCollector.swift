@@ -352,6 +352,20 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
             "groupCount": kept.count
         ]
 
+        // Standard device/app identity (appPkgName, appVer, model, brand,
+        // sdkVer, os, ...). appendCommonFields supplies only netType/libVer/
+        // sesId/platform/cf, so without this merge the beacon reaches the
+        // backend with an empty appPkgName and no app version — breaking
+        // app-level filtering on these documents.
+        //
+        // Merged non-destructively: anything already set above (cid, pid, ts)
+        // wins, and the diag* fields below remain the authoritative
+        // "at diagnostic time" values.
+        let staticMetrics = AppMetrics.shared.getAppMetrics()
+        for (key, value) in staticMetrics where beacon[key] == nil {
+            beacon[key] = value
+        }
+
         if kept.count < groups.count {
             beacon["groupsTruncated"] = true
             beacon["groupsDropped"]   = groups.count - kept.count
