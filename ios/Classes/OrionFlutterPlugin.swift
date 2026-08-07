@@ -138,12 +138,6 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
             //    is context-free and satisfies the C function pointer requirement.
             OrionFlutterPlugin.previousUncaughtExceptionHandler = NSGetUncaughtExceptionHandler()
             NSSetUncaughtExceptionHandler { exception in
-                // DIAGNOSTIC (1.2.28): unconditional NSLog — OrionLogger is
-                // gated and produces nothing in release builds, which made it
-                // impossible to tell whether this handler was firing at all.
-                // Remove once iOS crash capture is confirmed working.
-                NSLog("[Orion] CRASH-DIAG handler FIRED: \(exception.name.rawValue)")
-
                 // Build the Orion crash beacon.
                 var beacon: [String: Any] = [
                     "source":           "ios_native",
@@ -172,9 +166,7 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
                 //    Thread.sleep(0.5) was an attempt to win that race and has
                 //    been removed. The beacon is now sent by
                 //    OrionCrashStore.flushPendingCrash() on the next launch.
-                NSLog("[Orion] CRASH-DIAG beacon built (\(beacon.count) keys), calling persist")
                 OrionCrashStore.persist(beacon)
-                NSLog("[Orion] CRASH-DIAG persist returned")
 
                 // ✅ Forward to the previously installed handler (Crashlytics, Sentry, etc.)
                 OrionFlutterPlugin.previousUncaughtExceptionHandler?(exception)
