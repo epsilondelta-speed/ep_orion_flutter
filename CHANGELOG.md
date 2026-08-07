@@ -1,6 +1,7 @@
+## 1.2.29
+iOS fixes new beacon delivery type added
 
 ## 1.2.28
-
 Reliable iOS crash delivery bug fix.
 iOS hang rate fixed.
 
