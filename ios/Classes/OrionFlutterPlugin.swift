@@ -111,6 +111,14 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
             UIDevice.current.isBatteryMonitoringEnabled = true
 
             iOSHealthTracker.shared.initialize()
+
+            // 1.2.29: subscribe to MetricKit. The OS collects diagnostics
+            // out-of-process and delivers them in a daily batch at launch, so
+            // this adds no timers, no polling and no main-thread work — it is
+            // idle until a payload arrives. Provides hang stacks, watchdog
+            // terminations (the true iOS ANR analogue) and signal-class
+            // crashes without installing signal handlers. No-op below iOS 14.
+            OrionMetricKitCollector.shared.start()
             StartupTypeTracker.shared.detectStartupType()
             iOSSamplingManager.shared.initialize(cid: cid, pid: pid)
 
