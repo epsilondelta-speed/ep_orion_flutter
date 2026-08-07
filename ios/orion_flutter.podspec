@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'orion_flutter'
-  s.version          = '1.2.28'
+  s.version          = '1.2.29'
   s.summary          = 'Orion Flutter SDK — Real User Monitoring for Flutter apps.'
   s.description      = <<-DESC
     Orion Flutter SDK tracks screen performance (TTID/TTFD), frame metrics,
@@ -9,7 +9,7 @@ Pod::Spec.new do |s|
   DESC
 
   s.homepage         = 'https://github.com/epsilondelta-speed/orion-flutter'
-  s.license          = { :type => 'MIT', :file => '../LICENSE' }
+  s.license = { :type => 'Commercial', :file => '../LICENSE' }
   s.author           = { 'Epsilon Delta' => 'support@epsilondelta.co' }
   s.source           = { :path => '.' }
 
@@ -25,7 +25,7 @@ Pod::Spec.new do |s|
   s.swift_version    = '5.0'
 
   # iOS system frameworks used
-  s.frameworks       = 'UIKit', 'Foundation', 'Network', 'CryptoKit'
+  s.frameworks       = 'UIKit', 'Foundation', 'Network', 'CryptoKit', 'MetricKit'
 
   # Required for zlib (GZIP compression used in SendData.swift)
   s.library          = 'z'
