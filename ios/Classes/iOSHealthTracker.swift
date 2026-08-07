@@ -66,6 +66,20 @@ final class iOSHealthTracker {
     private var lastMainThreadPing: Date = Date()
     private let pingLock = NSLock()
 
+    /// In-progress hang state. Guarded by `pingLock` — written by the
+    /// detector's timer thread and read/reset by getSessionMetrics() on the
+    /// beacon path, so it is genuinely shared. `pingLock` is always released
+    /// before recordHang() acquires `lock`, so the two never nest.
+    ///
+    /// While the main thread is blocked it cannot service the ping, so every
+    /// tick sees an ever-growing gap. Recording on each tick counts ONE hang
+    /// many times — a 6 s block produced 24 records of 250, 500 … 6000 ms,
+    /// inflating hangCount and pushing pctOfSession above 100%. We instead
+    /// hold the running maximum and record a single entry when the main
+    /// thread recovers.
+    private var hangInProgress = false
+    private var hangMaxGapMs   = 0
+
     /// One detected main-thread hang.
     private struct HangRecord {
         let durationMs: Int
@@ -142,6 +156,9 @@ final class iOSHealthTracker {
     private func resetPingClock() {
         pingLock.lock()
         lastMainThreadPing = Date()
+        // Any hang measurement spanning the reset is invalid.
+        hangInProgress = false
+        hangMaxGapMs   = 0
         pingLock.unlock()
     }
 
@@ -174,11 +191,38 @@ final class iOSHealthTracker {
             let gap = Date().timeIntervalSince(lastPing)
 
             if gap > self.hangThreshold {
+                self.pingLock.lock()
                 if gap > self.suspensionCeiling {
                     // App was suspended, not hung — see suspensionCeiling.
+                    // Abandon any in-progress hang: the measurement is
+                    // meaningless once suspension is in play.
+                    self.hangInProgress = false
+                    self.hangMaxGapMs   = 0
+                    self.pingLock.unlock()
                     OrionLogger.debug("iOSHealthTracker: ignoring \(Int(gap))s gap (app suspension, not a hang)")
                 } else {
-                    self.recordHang(durationMs: Int(gap * 1000))
+                    // Hang ongoing. Track the largest gap seen; do NOT record
+                    // yet — the hang has not finished and its true duration
+                    // is still growing.
+                    self.hangInProgress = true
+                    self.hangMaxGapMs   = max(self.hangMaxGapMs, Int(gap * 1000))
+                    self.pingLock.unlock()
+                }
+            } else {
+                // Main thread serviced the ping again — if a hang was in
+                // progress it has now ended. Record exactly one entry using
+                // the longest gap observed, accurate to within one ping
+                // interval (250 ms).
+                self.pingLock.lock()
+                let wasInHang = self.hangInProgress
+                let duration  = self.hangMaxGapMs
+                self.hangInProgress = false
+                self.hangMaxGapMs   = 0
+                self.pingLock.unlock()
+
+                // recordHang takes `lock`; pingLock is already released.
+                if wasInHang && duration > 0 {
+                    self.recordHang(durationMs: duration)
                 }
             }
 
@@ -238,6 +282,15 @@ final class iOSHealthTracker {
     // MARK: - Session Metrics
 
     func getSessionMetrics() -> [String: Any] {
+        // A hang still in progress at beacon time would otherwise never be
+        // recorded — flush it so a screen exited mid-hang still reports one.
+        pingLock.lock()
+        let pendingHang = hangInProgress ? hangMaxGapMs : 0
+        hangInProgress  = false
+        hangMaxGapMs    = 0
+        pingLock.unlock()
+        if pendingHang > 0 { recordHang(durationMs: pendingHang) }
+
         lock.lock()
         let memWarn      = memoryWarningCount
         let hangsTotal   = hangCount
@@ -284,7 +337,11 @@ final class iOSHealthTracker {
         // Hang time as a share of session duration — the single best severity
         // signal, since 3 hangs in 10s is very different from 3 in 10min.
         let sessionMs = max(1, Int(Date().timeIntervalSince(sessionStart) * 1000))
-        let pct = (Double(totalMs) / Double(sessionMs)) * 100.0
+        // Clamped at 100: hang time cannot exceed session time, so a value
+        // above it always indicates a measurement fault rather than a real
+        // reading. Pre-1.2.30 data shows values like 471% caused by a single
+        // hang being counted once per 250 ms tick.
+        let pct = min(100.0, (Double(totalMs) / Double(sessionMs)) * 100.0)
 
         let top = records
             .sorted { $0.durationMs > $1.durationMs }
