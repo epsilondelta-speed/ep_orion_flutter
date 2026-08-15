@@ -1,3 +1,6 @@
+## 1.2.31
+Fixed: iOS Health session reset, ios hang detector + screen tracker  bug Fix
+
 ## 1.2.30
 Fixed: iOS hang detector improvement
 
