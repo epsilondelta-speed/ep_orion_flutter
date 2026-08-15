@@ -80,11 +80,62 @@ final class iOSHealthTracker {
     private var hangInProgress = false
     private var hangMaxGapMs   = 0
 
+    /// True while the app has been backgrounded and not yet foregrounded.
+    ///
+    /// SDK-14: the suspensionCeiling alone cannot tell a real 30-second hang
+    /// from a 30-second suspension, so it discarded both — which inverted the
+    /// data. A screen that hung for 30 s produced ZERO records and looked
+    /// clean, while a screen that hung for 6 s looked bad: the worst screens
+    /// in an app were the ones that disappeared.
+    ///
+    /// Tracking background state resolves it. A gap above the ceiling that
+    /// spans a background transition is suspension; one that occurs entirely
+    /// in the foreground is a genuine hang, recorded with
+    /// `ceilingTruncated: true` so consumers know the duration is a floor.
+    private var appWasBackgrounded = false
+
+    /// Screen captured when a hang STARTS, not when it is recorded.
+    ///
+    /// SDK-16: a hang still running when the user navigates is flushed during
+    /// the next screen's beacon assembly, ~100 ms after `onFlutterScreenStart`
+    /// has already moved `currentScreen` forward. It was therefore attributed
+    /// to the screen the user navigated TO, not the one that hung — and
+    /// navigation transitions are exactly where hangs cluster.
+    private var hangStartScreen: String = "UnknownScreen"
+
+    /// Mirror of `currentScreen` guarded by `pingLock` rather than `lock`.
+    ///
+    /// The 250 ms detector tick needs the screen name to stamp a hang's start,
+    /// but reading `currentScreen` would mean taking `lock` four times a
+    /// second on a path that already holds `pingLock` — lock nesting on the
+    /// hot path. Mirroring costs one extra assignment per screen change.
+    private var detectorScreen: String = "UnknownScreen"
+
+    /// Session this tracker's counters belong to.
+    ///
+    /// SDK-22: `resetSession()` exists but nothing ever called it, while
+    /// `SessionManager.getSessionId()` rotates lazily after 30 minutes idle.
+    /// So counters accumulated across session boundaries:
+    ///
+    ///   * a hang recorded in session S1 was re-reported in every later
+    ///     beacon, including ones stamped S2 — the backend's `(sesId, ts)`
+    ///     dedupe then saw the same hang twice, once per session
+    ///   * `sessionStartTime` never moved, so `pctOfSession` divided by time
+    ///     since app launch rather than since session start, under-reporting
+    ///     severity on long-lived processes
+    ///
+    /// nil until the first beacon, so the first read adopts rather than
+    /// resets.
+    private var trackedSessionId: String? = nil
+
     /// One detected main-thread hang.
     private struct HangRecord {
-        let durationMs: Int
-        let epochMs:    Int64
-        let screen:     String
+        let durationMs:       Int
+        let epochMs:          Int64
+        let screen:           String
+        /// True when the gap exceeded suspensionCeiling while the app was in
+        /// the foreground — the duration is then a floor, not an exact value.
+        let ceilingTruncated: Bool
     }
     private var hangs: [HangRecord] = []
 
@@ -148,7 +199,21 @@ final class iOSHealthTracker {
             self?.resetPingClock()
         }
 
-        observers = [memObs, lpObs, thermalObs, activeObs]
+        // SDK-14: mark that a suspension window has begun, so an
+        // above-ceiling gap can be attributed to suspension rather than
+        // discarded blindly.
+        let bgObs = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object:  nil,
+            queue:   .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.pingLock.lock()
+            self.appWasBackgrounded = true
+            self.pingLock.unlock()
+        }
+
+        observers = [memObs, lpObs, thermalObs, activeObs, bgObs]
         startHangDetection()
         OrionLogger.debug("iOSHealthTracker: Initialized")
     }
@@ -157,8 +222,9 @@ final class iOSHealthTracker {
         pingLock.lock()
         lastMainThreadPing = Date()
         // Any hang measurement spanning the reset is invalid.
-        hangInProgress = false
-        hangMaxGapMs   = 0
+        hangInProgress     = false
+        hangMaxGapMs       = 0
+        appWasBackgrounded = false
         pingLock.unlock()
     }
 
@@ -171,6 +237,12 @@ final class iOSHealthTracker {
         lock.lock()
         currentScreen = screen
         lock.unlock()
+
+        // Mirror under pingLock so the detector can stamp a hang's start
+        // screen without nesting locks. Sequential, never nested.
+        pingLock.lock()
+        detectorScreen = screen
+        pingLock.unlock()
     }
 
     // MARK: - Hang Detection
@@ -193,17 +265,36 @@ final class iOSHealthTracker {
             if gap > self.hangThreshold {
                 self.pingLock.lock()
                 if gap > self.suspensionCeiling {
-                    // App was suspended, not hung — see suspensionCeiling.
-                    // Abandon any in-progress hang: the measurement is
-                    // meaningless once suspension is in play.
+                    // SDK-14: above the ceiling, background state decides.
+                    let wasBackgrounded = self.appWasBackgrounded
+                    let ceilScreen      = self.hangInProgress ? self.hangStartScreen
+                                                             : self.detectorScreen
                     self.hangInProgress = false
                     self.hangMaxGapMs   = 0
                     self.pingLock.unlock()
-                    OrionLogger.debug("iOSHealthTracker: ignoring \(Int(gap))s gap (app suspension, not a hang)")
+
+                    if wasBackgrounded {
+                        // Genuine suspension — the timer and main thread were
+                        // both stopped by iOS. Discard.
+                        OrionLogger.debug("iOSHealthTracker: ignoring \(Int(gap))s gap (app suspension, not a hang)")
+                    } else {
+                        // App never left the foreground, so this is a real
+                        // hang that simply exceeded the ceiling. Record it
+                        // rather than losing the worst hangs in the app.
+                        OrionLogger.debug("iOSHealthTracker: long foreground hang \(Int(gap))s (ceiling-truncated)")
+                        self.recordHang(durationMs: Int(gap * 1000),
+                                        ceilingTruncated: true,
+                                        screenOverride: ceilScreen)
+                    }
                 } else {
                     // Hang ongoing. Track the largest gap seen; do NOT record
                     // yet — the hang has not finished and its true duration
                     // is still growing.
+                    if !self.hangInProgress {
+                        // SDK-16: stamp the screen at hang START. By flush
+                        // time the user may already be on the next screen.
+                        self.hangStartScreen = self.detectorScreen
+                    }
                     self.hangInProgress = true
                     self.hangMaxGapMs   = max(self.hangMaxGapMs, Int(gap * 1000))
                     self.pingLock.unlock()
@@ -216,13 +307,14 @@ final class iOSHealthTracker {
                 self.pingLock.lock()
                 let wasInHang = self.hangInProgress
                 let duration  = self.hangMaxGapMs
+                let screen    = self.hangStartScreen
                 self.hangInProgress = false
                 self.hangMaxGapMs   = 0
                 self.pingLock.unlock()
 
                 // recordHang takes `lock`; pingLock is already released.
                 if wasInHang && duration > 0 {
-                    self.recordHang(durationMs: duration)
+                    self.recordHang(durationMs: duration, screenOverride: screen)
                 }
             }
 
@@ -238,16 +330,20 @@ final class iOSHealthTracker {
         hangDetectorTimer = timer
     }
 
-    private func recordHang(durationMs: Int) {
+    private func recordHang(durationMs: Int,
+                            ceilingTruncated: Bool = false,
+                            screenOverride: String? = nil) {
         lock.lock()
         hangCount += 1
         let count  = hangCount
-        let screen = currentScreen
+        // Prefer the screen captured when the hang started (SDK-16).
+        let screen = screenOverride ?? currentScreen
 
         let record = HangRecord(
-            durationMs: durationMs,
-            epochMs:    Int64(Date().timeIntervalSince1970 * 1000),
-            screen:     screen
+            durationMs:       durationMs,
+            epochMs:          Int64(Date().timeIntervalSince1970 * 1000),
+            screen:           screen,
+            ceilingTruncated: ceilingTruncated
         )
 
         if hangs.count < maxRetainedHangs {
@@ -281,15 +377,81 @@ final class iOSHealthTracker {
 
     // MARK: - Session Metrics
 
+    /// Beacon path. MUTATING — flushes any in-progress hang before reading,
+    /// so a screen exited mid-hang still reports it.
+    ///
+    /// SDK-04: use `peekSessionMetrics()` for anything that is logically a
+    /// read. A host app polling a mutating "getter" inflates its own hang
+    /// counts at the polling rate.
     func getSessionMetrics() -> [String: Any] {
-        // A hang still in progress at beacon time would otherwise never be
-        // recorded — flush it so a screen exited mid-hang still reports one.
+        // Rotation check FIRST. If the session rotated, any in-progress hang
+        // spans the boundary and is invalid — resetIfSessionRotated clears
+        // hangInProgress, so the flush below correctly finds nothing pending.
+        // Flushing first would record a hang that snapshot() then discards.
+        resetIfSessionRotated()
+
         pingLock.lock()
-        let pendingHang = hangInProgress ? hangMaxGapMs : 0
-        hangInProgress  = false
-        hangMaxGapMs    = 0
+        let pendingHang   = hangInProgress ? hangMaxGapMs : 0
+        let pendingScreen = hangStartScreen
+        hangInProgress    = false
+        hangMaxGapMs      = 0
         pingLock.unlock()
-        if pendingHang > 0 { recordHang(durationMs: pendingHang) }
+        // SDK-16: this is THE path that was mis-attributing. The flush happens
+        // during the next screen's beacon assembly, so without the captured
+        // start screen the hang would be stamped with the wrong one.
+        if pendingHang > 0 {
+            recordHang(durationMs: pendingHang, screenOverride: pendingScreen)
+        }
+
+        return snapshot()
+    }
+
+    /// Pure read — no flush, no mutation, no `pingLock`.
+    ///
+    /// Used by the public `getRuntimeMetrics()` API (SDK-04) and by the crash
+    /// handler (SDK-11), where taking a second lock on an arbitrary thread
+    /// during termination risks losing the crash beacon entirely.
+    func peekSessionMetrics() -> [String: Any] {
+        return snapshot()
+    }
+
+    /// Reset counters if the session rotated since the last read.
+    ///
+    /// Called at the top of every metrics read. Rotation is detected rather
+    /// than pushed because SessionManager has no rotation callback — it mints
+    /// a new id lazily inside `getSessionId()`.
+    private func resetIfSessionRotated() {
+        let sid = SessionManager.getSessionId()
+
+        lock.lock()
+        let previous = trackedSessionId
+        trackedSessionId = sid
+        guard let previous = previous, previous != sid else {
+            lock.unlock()
+            return
+        }
+        // Rotated: this beacon belongs to a new session, so anything counted
+        // under the old one has already been reported and must not carry over.
+        memoryWarningCount = 0
+        hangCount          = 0
+        hangs.removeAll()
+        sessionStartTime   = Date()
+        lock.unlock()
+
+        // Any in-progress hang measurement spans the boundary and is invalid.
+        pingLock.lock()
+        hangInProgress = false
+        hangMaxGapMs   = 0
+        pingLock.unlock()
+
+        OrionLogger.debug("iOSHealthTracker: session rotated, counters reset")
+    }
+
+    private func snapshot() -> [String: Any] {
+        // Idempotent: getSessionMetrics() already called this, and the second
+        // call short-circuits because trackedSessionId now matches. Kept here
+        // so peekSessionMetrics() — which does not flush — is also protected.
+        resetIfSessionRotated()
 
         lock.lock()
         let memWarn      = memoryWarningCount
@@ -347,11 +509,14 @@ final class iOSHealthTracker {
             .sorted { $0.durationMs > $1.durationMs }
             .prefix(maxReportedHangs)
             .map { r -> [String: Any] in
-                [
+                var e: [String: Any] = [
                     "durMs":  r.durationMs,
                     "ts":     r.epochMs,
                     "screen": r.screen
                 ]
+                // Only present when true, so ordinary hangs stay byte-identical.
+                if r.ceilingTruncated { e["ceilingTruncated"] = true }
+                return e
             }
 
         return [

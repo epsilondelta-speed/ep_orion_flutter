@@ -150,7 +150,15 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
                     "cid":              OrionConfig.companyId,
                     "pid":              OrionConfig.projectId,
                     "flutter":          1,
-                    "iosHealth":        iOSHealthTracker.shared.getSessionMetrics()
+                    // SDK-11: peek, never get. getSessionMetrics() takes
+                    // pingLock and may take `lock` via recordHang(). This
+                    // handler runs on whatever thread threw — often a
+                    // background thread, during termination. If any thread
+                    // holds `lock` the handler stalls; if the crashing thread
+                    // holds it, the handler deadlocks and the crash beacon is
+                    // never persisted. A lost crash costs far more than the
+                    // device-health snapshot is worth.
+                    "iosHealth":        iOSHealthTracker.shared.peekSessionMetrics()
                 ]
                 let staticMetrics = AppMetrics.shared.getAppMetrics()
                 for (key, value) in staticMetrics where beacon[key] == nil {
@@ -187,7 +195,11 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
     private func handleGetRuntimeMetrics(result: @escaping FlutterResult) {
         do {
             var metrics = AppMetrics.shared.getRuntimeMetrics()
-            metrics["iosHealth"] = iOSHealthTracker.shared.getSessionMetrics()
+            // SDK-04: this is a public read-only API. getSessionMetrics()
+            // flushes any in-progress hang and calls recordHang(), so a host
+            // app polling this would inflate its own hang counts at the
+            // polling rate.
+            metrics["iosHealth"] = iOSHealthTracker.shared.peekSessionMetrics()
             if let jsonData   = try? JSONSerialization.data(withJSONObject: metrics),
                let jsonString = String(data: jsonData, encoding: .utf8) {
                 result(jsonString)
@@ -377,7 +389,12 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
                 "action":           generateActionableInsight(exception),
                 "networkState":     SendData.currentNetworkType,
                 "lastUserInteraction": "unknown",
-                "iosHealth":        iOSHealthTracker.shared.getSessionMetrics()
+                // Peek: a Flutter error is an event, not a beacon boundary.
+                // Using the mutating variant here would flush an in-progress
+                // hang early and fragment one long hang into pieces whenever
+                // errors fire during it. The single mutating call per screen
+                // beacon lives in FlutterSendData.
+                "iosHealth":        iOSHealthTracker.shared.peekSessionMetrics()
             ]
 
             let staticMetrics = AppMetrics.shared.getAppMetrics()

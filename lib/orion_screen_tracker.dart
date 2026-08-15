@@ -81,6 +81,29 @@ class OrionScreenTracker extends RouteObserver<PageRoute<dynamic>> {
       if (!OrionFlutter.isSupported) return;
       _finalizeTracking(route);
       _updateCurrentScreen(previousRoute);
+
+      // ✅ SDK-17: re-arm tracking for the screen the pop reveals.
+      //
+      // Previously didPop stopped short here, unlike didPush and didReplace.
+      // Two consequences, both silent:
+      //
+      //   1. The revealed screen emitted NO beacon at all. Navigating
+      //      A → B → back to A produced beacons for A's first visit and for
+      //      B, but nothing for A's second visit — so any screen users
+      //      normally return to was systematically under-reported.
+      //
+      //   2. onFlutterScreenStart never fired, so the native side kept the
+      //      POPPED screen's name. On iOS that meant hangs on the revealed
+      //      screen were attributed to the screen the user had just left.
+      //
+      // OrionManualTracker.resumePreviousScreen() already calls
+      // startTracking(previous), so this also brings the automatic and manual
+      // trackers back into agreement.
+      //
+      // Note this restarts TTID/TTFD for the revealed screen. That is
+      // intended: a pop is a genuine re-display, and the user waits for it
+      // again.
+      _startTracking(previousRoute);
     } catch (e) {
       orionPrint('⚠️ OrionScreenTracker: didPop error (ignored): $e');
     }

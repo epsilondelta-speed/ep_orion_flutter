@@ -134,7 +134,11 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
     func didReceive(_ payloads: [MXDiagnosticPayload]) {
         queue.async { [weak self] in
             guard let self = self else { return }
-            for payload in payloads {
+            // SDK-07: MetricKit does not document delivery order, and
+            // process() skips any payload older than the last one seen. If a
+            // newer payload arrived first, every older payload in the same
+            // batch would be silently discarded. Sort ascending first.
+            for payload in payloads.sorted(by: { $0.timeStampEnd < $1.timeStampEnd }) {
                 self.process(payload)
             }
         }
@@ -155,28 +159,24 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
         // ── 1. Collect raw diagnostics ───────────────────────────────────
         var items: [DiagItem] = []
 
-        // Device/app metadata lives on each MXDiagnostic, not on the payload.
-        // Every diagnostic in one payload comes from the same device and OS,
-        // so the first one seen is representative.
-        var meta: MXMetaData? = nil
-        var diagAppVersion: String? = nil
 
         for d in payload.hangDiagnostics ?? [] {
             guard items.count < maxDiagnosticsPerPayload else { break }
-            if meta == nil { meta = d.metaData; diagAppVersion = d.applicationVersion }
             let ms = Int(d.hangDuration.converted(to: .milliseconds).value)
             items.append(DiagItem(
                 diagType: "hang",
                 category: hangCategory(ms),
                 durationMs: ms,
                 stack: Self.flatten(d.callStackTree, limit: maxFrames) ?? [],
-                extra: [:]
+                extra: [:],
+                appVersion: d.applicationVersion,
+                osVersion:  d.metaData.osVersion,
+                device:     d.metaData.deviceType
             ))
         }
 
         for d in payload.crashDiagnostics ?? [] {
             guard items.count < maxDiagnosticsPerPayload else { break }
-            if meta == nil { meta = d.metaData; diagAppVersion = d.applicationVersion }
             let isWatchdog = Self.isWatchdogTermination(d)
             var extra: [String: Any] = [:]
             if let reason = d.terminationReason { extra["terminationReason"] = reason }
@@ -188,31 +188,38 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
                 category: "critical",
                 durationMs: 0,
                 stack: Self.flatten(d.callStackTree, limit: maxFrames) ?? [],
-                extra: extra
+                extra: extra,
+                appVersion: d.applicationVersion,
+                osVersion:  d.metaData.osVersion,
+                device:     d.metaData.deviceType
             ))
         }
 
         for d in payload.cpuExceptionDiagnostics ?? [] {
             guard items.count < maxDiagnosticsPerPayload else { break }
-            if meta == nil { meta = d.metaData; diagAppVersion = d.applicationVersion }
             items.append(DiagItem(
                 diagType: "cpuException",
                 category: "severe",
                 durationMs: Int(d.totalCPUTime.converted(to: .milliseconds).value),
                 stack: Self.flatten(d.callStackTree, limit: maxFrames) ?? [],
-                extra: [:]
+                extra: [:],
+                appVersion: d.applicationVersion,
+                osVersion:  d.metaData.osVersion,
+                device:     d.metaData.deviceType
             ))
         }
 
         for d in payload.diskWriteExceptionDiagnostics ?? [] {
             guard items.count < maxDiagnosticsPerPayload else { break }
-            if meta == nil { meta = d.metaData; diagAppVersion = d.applicationVersion }
             items.append(DiagItem(
                 diagType: "diskWriteException",
                 category: "mild",
                 durationMs: 0,
                 stack: Self.flatten(d.callStackTree, limit: maxFrames) ?? [],
-                extra: ["bytesWritten": Int(d.totalWritesCaused.converted(to: .bytes).value)]
+                extra: ["bytesWritten": Int(d.totalWritesCaused.converted(to: .bytes).value)],
+                appVersion: d.applicationVersion,
+                osVersion:  d.metaData.osVersion,
+                device:     d.metaData.deviceType
             ))
         }
 
@@ -220,11 +227,7 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
 
         // ── 2. Group by signature and emit ONE beacon ────────────────────
         let groups = group(items)
-        send(buildBeacon(groups: groups,
-                         totalItems: items.count,
-                         payload: payload,
-                         meta: meta,
-                         diagAppVersion: diagAppVersion))
+        send(buildBeacon(groups: groups, totalItems: items.count, payload: payload))
 
         OrionLogger.debug("MetricKit: \(items.count) diagnostic(s) -> \(groups.count) group(s), 1 beacon")
     }
@@ -238,6 +241,13 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
         let durationMs: Int
         let stack:      [String]
         let extra:      [String: Any]
+        /// SDK-09/10: the app version recorded on THIS diagnostic. Payload
+        /// metadata was previously taken first-wins across a 24 h window in
+        /// which the app may have updated, so a crash could inherit a hang's
+        /// version. Carried per item so each group reports its own.
+        let appVersion: String?
+        let osVersion:  String?
+        let device:     String?
     }
 
     /// A set of diagnostics sharing a signature, reported once with a count.
@@ -249,7 +259,10 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
         var worstMs:     Int
         var totalMs:     Int
         let stack:       [String]
-        let extra:       [String: Any]
+        var extra:       [String: Any]
+        let appVersion:  String?
+        let osVersion:   String?
+        let device:      String?
     }
 
     /// Collapse diagnostics that share a signature.
@@ -273,6 +286,14 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
                 if Self.severityRank(item.category) > Self.severityRank(g.category) {
                     g.category = item.category
                 }
+                // SDK-12: extra was first-wins for the whole dictionary.
+                // Correct for signal/exceptionType/terminationReason, which
+                // are identical across stack-identical members — but wrong for
+                // bytesWritten, which must sum.
+                if let add = item.extra["bytesWritten"] as? Int {
+                    let existing = (g.extra["bytesWritten"] as? Int) ?? 0
+                    g.extra["bytesWritten"] = existing + add
+                }
                 byFp[fp] = g
             } else {
                 byFp[fp] = DiagGroup(
@@ -283,7 +304,10 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
                     worstMs:     item.durationMs,
                     totalMs:     item.durationMs,
                     stack:       item.stack,
-                    extra:       item.extra
+                    extra:       item.extra,
+                    appVersion:  item.appVersion,
+                    osVersion:   item.osVersion,
+                    device:      item.device
                 )
             }
         }
@@ -312,23 +336,43 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
     /// grouping across sessions or devices.
     static func fingerprint(diagType: String, stack: [String], depth: Int) -> String {
         var input = diagType
-        for frame in stack.prefix(depth) { input += "|" + frame }
+
+        // SDK-05: hash BINARY NAMES ONLY, never the offsets.
+        //
+        // offsetIntoBinaryTextSegment shifts whenever code moves, so
+        // including it made the same bug produce a different fingerprint on
+        // every app build — and, because system-binary offsets shift too, on
+        // every iOS point release. One bug fragmented across
+        // (builds x iOS versions) in the issue list.
+        //
+        // Offsets stay in the emitted stack[] for future symbolication; they
+        // are simply excluded from the fingerprint input.
+        //
+        // NOTE: system frames are deliberately KEPT here, unlike the
+        // Android/Flutter fingerprinting rule. Once offsets are stripped, the
+        // binary *sequence* (libsystem_kernel -> pthread -> c -> c++abi ->
+        // objc = an ObjC-exception abort) is the only remaining signal.
+        for frame in stack.prefix(depth) {
+            let binary = frame.components(separatedBy: " +0x").first ?? frame
+            input += "|" + binary
+        }
 
         var hash: UInt64 = 0xcbf29ce484222325
         for byte in input.utf8 {
             hash ^= UInt64(byte)
             hash = hash &* 0x100000001b3
         }
-        return String(hash, radix: 16)
+        // SDK-13: zero-pad. String(_:radix:) drops leading zeros, so roughly
+        // 1 fingerprint in 16 was shorter than 16 chars — breaking anything
+        // that indexes, joins or validates on fixed width.
+        return String(format: "%016llx", hash)
     }
 
     // MARK: - Beacon assembly
 
     private func buildBeacon(groups: [DiagGroup],
                              totalItems: Int,
-                             payload: MXDiagnosticPayload,
-                             meta: MXMetaData?,
-                             diagAppVersion: String?) -> [String: Any] {
+                             payload: MXDiagnosticPayload) -> [String: Any] {
         let kept = Array(groups.prefix(maxGroups))
 
         var beacon: [String: Any] = [
@@ -371,15 +415,25 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
             beacon["groupsDropped"]   = groups.count - kept.count
         }
 
-        // App/OS version AT THE TIME of the diagnostic — may differ from the
-        // current build if the user updated in between. Sourced from the
-        // MXDiagnostic (MXDiagnosticPayload itself carries no metaData).
-        if let m = meta {
-            beacon["diagBuild"]  = m.applicationBuildVersion
-            beacon["diagOsVer"]  = m.osVersion
-            beacon["diagDevice"] = m.deviceType
+        // SDK-09: `appVer` merged from AppMetrics is the DELIVERY-time
+        // version. A crash that happened on 1.0.0 and was delivered after the
+        // user updated to 1.1.0 would be filed under 1.1.0 — inverting Release
+        // Health, the one screen whose purpose is attributing crashes to the
+        // release that caused them.
+        //
+        // Overwrite it with the diagnostic's own version when every group
+        // agrees. Per-group `diagAppVer` below is authoritative either way.
+        let versions = Set(kept.compactMap { $0.appVersion })
+        if versions.count == 1, let v = versions.first {
+            beacon["appVer"]     = v
+            beacon["diagAppVer"] = v
+        } else if !versions.isEmpty {
+            // Mixed versions in one payload — leave the beacon-level field
+            // alone and flag it, so the backend knows to read per-group.
+            beacon["diagAppVerMixed"] = true
         }
-        if let v = diagAppVersion { beacon["diagAppVer"] = v }
+        if let os = kept.first?.osVersion  { beacon["diagOsVer"]  = os }
+        if let dv = kept.first?.device     { beacon["diagDevice"] = dv }
 
         beacon["diagnostics"] = kept.map { g -> [String: Any] in
             var d: [String: Any] = [
@@ -395,9 +449,20 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
                 d["stackFrames"]    = g.stack.count
                 d["stackTruncated"] = g.stack.count >= maxFrames
                 // Frames are binaryName + offset; symbolication needs the
-                // dSYM and happens server-side.
+                // dSYM and happens server-side. The fingerprint above uses
+                // binary names only — offsets are not build-stable.
                 d["stackSymbolicated"] = false
+            } else {
+                // SDK-08: an unparseable call-stack tree yields an empty
+                // stack, and the fingerprint then hashes diagType alone —
+                // collapsing every stackless diagnostic of that type into one
+                // catch-all issue that renders as a blank row. Flag it so the
+                // backend can label it rather than hardcoding sentinel hashes.
+                d["stackUnavailable"] = true
             }
+            // SDK-09/10: per-group version, so a crash never inherits a
+            // hang's app version from elsewhere in the same 24 h payload.
+            if let v = g.appVersion { d["diagAppVer"] = v }
             for (k, v) in g.extra { d[k] = v }
             return d
         }
