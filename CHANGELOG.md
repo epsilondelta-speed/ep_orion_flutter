@@ -1,3 +1,6 @@
+## 1.2.34
+Android native bug fix 
+
 ## 1.2.33
 Android performance and data-correctness, CDN poll for config fixes
 
