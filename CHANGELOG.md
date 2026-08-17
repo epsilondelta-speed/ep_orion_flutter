@@ -1,3 +1,6 @@
+## 1.2.32
+Performance release. fixed aug 15 code review IOS & dart related performance changes
+
 ## 1.2.31
 Fixed: iOS Health session reset, ios hang detector + screen tracker  bug Fix
 
