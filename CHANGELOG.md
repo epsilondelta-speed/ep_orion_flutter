@@ -1,3 +1,6 @@
+## 1.2.33
+Android performance and data-correctness, CDN poll for config fixes
+
 ## 1.2.32
 Performance release. fixed aug 15 code review IOS & dart related performance changes
 
