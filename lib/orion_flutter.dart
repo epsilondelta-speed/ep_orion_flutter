@@ -53,6 +53,13 @@ class OrionFlutter {
       return await _channel.invokeMethod<String>('initializeEdOrion', {
         'cid': cid,
         'pid': pid,
+        // Lets the native layer turn its own logging on in a debug host build.
+        // It cannot determine this itself — the only BuildConfig it can see is
+        // the SDK's own, and the published Android AAR is a release variant, so
+        // its DEBUG constant is false in every customer build. kDebugMode is
+        // compile-time constant, so this is `false` in release and the native
+        // logger stays off, exactly as before.
+        'debug': kDebugMode,
       });
     } catch (e) {
       orionPrint('initializeEdOrion error — $e');
