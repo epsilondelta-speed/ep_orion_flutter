@@ -7,13 +7,17 @@ import UIKit
 /// Thread-safety fixes:
 ///
 /// 1. UIDevice.current.batteryLevel / batteryState MUST be read on the main
-///    thread.  Previously getSessionMetrics() called currentBatteryLevel() /
-///    isCharging() directly, but getSessionMetrics() is called from
-///    FlutterSendData (platform thread, not main thread) → threading violation
-///    that can crash on certain iOS versions.
+///    thread.  Previously getSessionMetrics() read UIDevice directly, but it is
+///    called from FlutterSendData (platform thread, not main thread) →
+///    threading violation that can crash on certain iOS versions.
 ///    Fix: cache the values on the main thread whenever they change, via
 ///    UIDevice battery notification observers.  All getters return the cached
 ///    values, which are safe to read from any thread.
+///
+///    Note for readers of older revisions: the `currentBatteryLevel()` method
+///    below is NOT the UIDevice-reading accessor that fix removed. It is a
+///    1.2.32 addition (IOS-05) that returns the cached Int and touches no
+///    UIKit — see its own documentation.
 ///
 /// 2. Double-call guard: both the Dart-side onAppForeground/Background methods
 ///    AND applicationDidBecomeActive / applicationDidEnterBackground call
@@ -134,6 +138,24 @@ final class BatteryMetricsTracker {
     }
 
     // MARK: - Metrics
+
+    /// Current battery percentage, straight from the cache.
+    ///
+    /// IOS-05: AppMetrics.batteryPercent() used to obtain this single Int by
+    /// calling getSessionMetrics() and subscripting the result — which meant
+    /// taking the lock, computing six derived durations and running six
+    /// String(format:) calls to build a twelve-key dictionary, then discarding
+    /// eleven of the twelve values. FlutterSendData had already called
+    /// getSessionMetrics() two lines earlier for the beacon itself, so the
+    /// whole thing ran twice per beacon on the main thread.
+    ///
+    /// Safe from any thread: the cache is written on the main thread by the
+    /// UIDevice battery notifications, never read from UIKit here.
+    func currentBatteryLevel() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return cachedBatteryLevel
+    }
 
     func getSessionMetrics() -> [String: Any] {
         lock.lock()

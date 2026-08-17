@@ -5,6 +5,7 @@ import 'orion_flutter_platform_interface.dart';
 import 'orion_sampling_manager.dart';
 import 'orion_http_overrides.dart';
 import 'orion_cold_start.dart';
+import 'orion_logger.dart';
 
 export 'orion_wake_lock.dart';
 export 'orion_rage_click_tracker.dart';
@@ -54,7 +55,7 @@ class OrionFlutter {
         'pid': pid,
       });
     } catch (e) {
-      debugPrint('[Orion] initializeEdOrion error — $e');
+      orionPrint('initializeEdOrion error — $e');
       return null;
     }
   }
@@ -176,7 +177,7 @@ class OrionFlutter {
 
     try {
       if (!SamplingManager.instance.shouldSend()) {
-        debugPrint('[Orion] Beacon dropped by sampling '
+        orionPrint('Beacon dropped by sampling '
             '(effective: ${SamplingManager.instance.getEffectivePercent()}%)');
         return;
       }
@@ -185,7 +186,7 @@ class OrionFlutter {
       //    in production, avoiding the cost of JsonEncoder.withIndent on every
       //    screen transition.
       if (kDebugMode) {
-        debugPrint(
+        orionPrint(
           '\n========== ORION BEACON (Dart) ==========\n'
               'screen=$screen ttid=$ttid ttfd=$ttfd '
               'janky=$jankyFrames frozen=$frozenFrames '
@@ -209,7 +210,7 @@ class OrionFlutter {
         'rageClickCount': rageClickCount,
       });
     } catch (e) {
-      debugPrint('[Orion] trackFlutterScreen error — $e');
+      orionPrint('trackFlutterScreen error — $e');
     }
   }
 

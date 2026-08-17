@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'orion_logger.dart';
 
 /// SamplingManager — Remote runtime configuration for Orion Flutter SDK.
 ///
@@ -114,10 +114,10 @@ class SamplingManager {
       // Kick off the first fetch immediately.
       _fetchConfig();
 
-      debugPrint('[Orion] SamplingManager: initialized '
+      orionPrint('SamplingManager: initialized '
           'cid=$cid pid=$pid localRate=${(sampleRate * 100).round()}%');
     } catch (e) {
-      debugPrint('[Orion] SamplingManager: initialize error — $e');
+      orionPrint('SamplingManager: initialize error — $e');
     }
   }
 
@@ -140,22 +140,22 @@ class SamplingManager {
     try {
       if (!_firstBeaconSent) {
         _firstBeaconSent = true;
-        debugPrint('[Orion] SamplingManager: first beacon — always send');
+        orionPrint('SamplingManager: first beacon — always send');
         return true;
       }
       final percent = getEffectivePercent();
       if (percent >= 100) return true;
       if (percent <= 0) {
-        debugPrint('[Orion] SamplingManager: beacon dropped (0%)');
+        orionPrint('SamplingManager: beacon dropped (0%)');
         return false;
       }
       final roll = _random.nextInt(100) + 1; // 1..100 inclusive
       final send = roll <= percent;
-      debugPrint('[Orion] SamplingManager: roll=$roll percent=$percent → '
+      orionPrint('SamplingManager: roll=$roll percent=$percent → '
           '${send ? "SEND" : "DROP"}');
       return send;
     } catch (e) {
-      debugPrint('[Orion] SamplingManager: shouldSend error — $e');
+      orionPrint('SamplingManager: shouldSend error — $e');
       return true; // fail-open
     }
   }
@@ -216,7 +216,7 @@ class SamplingManager {
       _firstBeaconSent     = false;
       _activeRefreshMin    = _defaultRefreshMin;
 
-      debugPrint('[Orion] SamplingManager: shutdown');
+      orionPrint('SamplingManager: shutdown');
     } catch (_) {}
   }
 
@@ -232,7 +232,7 @@ class SamplingManager {
       );
       _activeRefreshMin = clamped;
     } catch (e) {
-      debugPrint('[Orion] SamplingManager: scheduleRefresh error — $e');
+      orionPrint('SamplingManager: scheduleRefresh error — $e');
     }
   }
 
@@ -240,7 +240,7 @@ class SamplingManager {
   /// currently active one. Avoids tearing down the timer on every fetch.
   void _maybeRescheduleRefresh(int newCrm) {
     if (newCrm != _activeRefreshMin) {
-      debugPrint('[Orion] SamplingManager: crm changed '
+      orionPrint('SamplingManager: crm changed '
           '$_activeRefreshMin → $newCrm — rescheduling refresh');
       _scheduleRefresh(newCrm);
     }
@@ -250,7 +250,7 @@ class SamplingManager {
 
   Future<void> _fetchConfig() async {
     try {
-      debugPrint('[Orion] SamplingManager: fetching CDN config...');
+      orionPrint('SamplingManager: fetching CDN config...');
 
       final response = await http.get(
         Uri.parse(_cdnUrl),
@@ -258,7 +258,7 @@ class SamplingManager {
       ).timeout(_fetchTimeout);
 
       if (response.statusCode != 200) {
-        debugPrint('[Orion] SamplingManager: CDN returned '
+        orionPrint('SamplingManager: CDN returned '
             '${response.statusCode} — using fallback');
         return;
       }
@@ -273,8 +273,8 @@ class SamplingManager {
       _remoteConfigVersion = _resolveConfigVersion(json);
       _configLoaded        = true;
 
-      debugPrint(
-        '[Orion] SamplingManager: config loaded — '
+      orionPrint(
+        'SamplingManager: config loaded — '
             's=$_remotePercent% sa=$_remoteShowAnalytics '
             'crm=${_remoteRefreshMin}m cv=$_remoteConfigVersion',
       );
@@ -282,9 +282,9 @@ class SamplingManager {
       // Reschedule periodic refresh if crm changed.
       _maybeRescheduleRefresh(configRefreshMin);
     } on TimeoutException {
-      debugPrint('[Orion] SamplingManager: CDN timeout — using fallback');
+      orionPrint('SamplingManager: CDN timeout — using fallback');
     } catch (e) {
-      debugPrint('[Orion] SamplingManager: CDN error — $e — using fallback');
+      orionPrint('SamplingManager: CDN error — $e — using fallback');
     }
   }
 
@@ -360,10 +360,10 @@ class SamplingManager {
   int _resolvePercent(Map<String, dynamic> config) {
     final v = _resolveField(config, 's', _coercePercent);
     if (v != null) {
-      debugPrint('[Orion] SamplingManager: resolved s=$v');
+      orionPrint('SamplingManager: resolved s=$v');
       return v;
     }
-    debugPrint('[Orion] SamplingManager: s not found — defaulting to '
+    orionPrint('SamplingManager: s not found — defaulting to '
         '$_defaultPercent');
     return _defaultPercent;
   }
@@ -371,7 +371,7 @@ class SamplingManager {
   bool _resolveShowAnalytics(Map<String, dynamic> config) {
     final v = _resolveField(config, 'sa', _coerceBool);
     if (v != null) {
-      debugPrint('[Orion] SamplingManager: resolved sa=$v');
+      orionPrint('SamplingManager: resolved sa=$v');
       return v;
     }
     return _defaultShowAnalytics;
@@ -382,7 +382,7 @@ class SamplingManager {
     if (v != null) {
       // Clamp at read time to guarantee invariant, but log the raw value here.
       final clamped = v < _minRefreshMin ? _minRefreshMin : v;
-      debugPrint('[Orion] SamplingManager: resolved crm=$v '
+      orionPrint('SamplingManager: resolved crm=$v '
           '${clamped != v ? "(clamped to $clamped)" : ""}');
       return v;
     }

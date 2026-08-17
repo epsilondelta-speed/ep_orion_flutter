@@ -1,9 +1,9 @@
 import 'dart:convert';
 import 'dart:io';
-import 'package:flutter/foundation.dart';
 import 'orion_network_tracker.dart';
 import 'orion_sampling_manager.dart';
 import 'orion_cold_start.dart';
+import 'orion_logger.dart';
 
 /// OrionHttpOverrides — Global HTTP interceptor for Orion SDK.
 /// Intercepts ALL dart:io HTTP requests including cached_network_image.
@@ -59,14 +59,14 @@ class OrionHttpOverrides extends HttpOverrides {
       //    each of which independently calls OrionNetworkTracker.addRequest(),
       //    causing the `network` array in beacons to be 2x/3x/... duplicated.
       if (existing is OrionHttpOverrides) {
-        debugPrint('[Orion] HttpOverrides: already installed, skipping');
+        orionPrint('HttpOverrides: already installed, skipping');
         return;
       }
 
       HttpOverrides.global = OrionHttpOverrides(previous: existing);
-      debugPrint('[Orion] HttpOverrides: installed');
+      orionPrint('HttpOverrides: installed');
     } catch (e) {
-      debugPrint('[Orion] HttpOverrides: install error — $e');
+      orionPrint('HttpOverrides: install error — $e');
     }
   }
 }

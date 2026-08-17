@@ -4,16 +4,36 @@ import UIKit
 /// iOSHealthTracker — Tracks iOS-specific device health signals.
 ///
 /// Thread-safety:
-///   lastMainThreadPing is written from the main thread (via
-///   DispatchQueue.main.async) and read from the background
-///   DispatchSourceTimer thread, so it is protected by its own NSLock,
-///   separate from the heavier session lock (avoids priority inversion
-///   between the very-frequent ping writes and session reads).
+///   lastMainThreadActivity is written from the main thread (from the run-loop
+///   observer) and read from the background DispatchSourceTimer thread, so it
+///   is protected by its own NSLock, separate from the heavier session lock
+///   (avoids priority inversion between the very-frequent activity writes and
+///   session reads).
 ///
-/// Hang detection (detail added 1.2.28):
-///   A background timer pings the main thread every 250 ms. If the gap since
-///   the last successful ping exceeds 500 ms, the main thread is considered
-///   hung for that interval.
+/// Hang detection (observer-based since 1.2.32):
+///   A CFRunLoopObserver on the main run loop records when the main thread
+///   last entered and left its work phase. A background timer samples that
+///   timestamp every 250 ms; if the main thread has been continuously busy for
+///   more than 500 ms it is considered hung for that interval.
+///
+///   IOS-01: through 1.2.31 this worked by *pinging* — the timer posted a
+///   block to the main queue on every tick, so the SDK woke the main thread
+///   four times a second for the entire life of the process, on every device,
+///   whether or not anything was happening. Each wake pulls the main thread
+///   out of mach_msg_trap, blocks the CPU from entering a deep idle state and
+///   defeats timer coalescing, which is a pure battery cost in an app that is
+///   otherwise sitting still.
+///
+///   The observer costs nothing: it fires only when the main run loop is
+///   already running, so it adds zero wakeups. It is also strictly more
+///   accurate than the ping, which could not distinguish "the main thread is
+///   idle" from "the main thread is blocked" — both look like an unanswered
+///   ping. CFRunLoopActivity.beforeWaiting tells us the run loop is parked and
+///   immediately available, so an idle app can never register a hang.
+///
+///   The timer no longer touches the main thread at all, is suspended outright
+///   while the app is backgrounded, and carries leeway so the OS can coalesce
+///   its remaining background-queue wakeups.
 ///
 ///   Prior to 1.2.28 only a count was kept — `hangCount: 3` told a developer
 ///   the app froze but nothing about where or how badly, which is not
@@ -34,6 +54,10 @@ final class iOSHealthTracker {
 
     // MARK: - Tunables
 
+    /// How often the background sampler reads the main thread's last-observed
+    /// activity. Since 1.2.32 this is purely a background-queue timer — it
+    /// does no main-thread work, so the rate no longer costs the app anything
+    /// on the main thread.
     private let pingInterval:  TimeInterval = 0.25
     private let hangThreshold: TimeInterval = 0.5
 
@@ -45,6 +69,11 @@ final class iOSHealthTracker {
     /// 5-minute background produced a bogus 300,000 ms "hang". Anything above
     /// this ceiling is discarded, and didBecomeActive also resets the ping
     /// clock so the first post-resume tick starts fresh.
+    ///
+    /// Largely redundant since 1.2.32, which suspends the sampler outright on
+    /// didEnterBackground and resets the clock before resuming it, so no tick
+    /// ever spans a suspension. Kept as the safety net for the case where the
+    /// background notification does not arrive.
     private let suspensionCeiling: TimeInterval = 10.0
 
     /// Upper bound on retained hang records. Hangs are rare compared to
@@ -63,7 +92,27 @@ final class iOSHealthTracker {
     private var observers:          [NSObjectProtocol] = []
     private let lock       = NSLock()
 
-    private var lastMainThreadPing: Date = Date()
+    /// When the main run loop was last observed entering or leaving work,
+    /// on the monotonic uptime clock. Guarded by `pingLock`.
+    ///
+    /// Monotonic rather than `Date()` (1.2.32): wall clock is not monotonic,
+    /// so an NTP correction or a user changing the device time stepped this
+    /// value and manufactured a hang out of nothing — a 2-second forward step
+    /// read as a 2-second freeze. `systemUptime` cannot step, and like
+    /// `Date()` it keeps advancing while the app is backgrounded, so the
+    /// suspensionCeiling / appWasBackgrounded logic below is unaffected.
+    private var lastMainThreadActivity: TimeInterval = ProcessInfo.processInfo.systemUptime
+
+    /// True while the main run loop is parked in its wait state.
+    ///
+    /// The distinction the ping could never draw. An idle main thread and a
+    /// blocked one both fail to answer a ping, so the old detector relied on
+    /// forcing a wake to prove liveness. `beforeWaiting` proves it for free:
+    /// the run loop reached the end of its work and went to sleep, so it is
+    /// available right now regardless of how long it has been sitting there.
+    /// While this is true no hang can be in progress, whatever the gap.
+    private var mainThreadIdle = true
+
     private let pingLock = NSLock()
 
     /// In-progress hang state. Guarded by `pingLock` — written by the
@@ -196,7 +245,11 @@ final class iOSHealthTracker {
             object:  nil,
             queue:   .main
         ) { [weak self] _ in
-            self?.resetPingClock()
+            guard let self = self else { return }
+            // Reset BEFORE resuming, so the first tick after resume measures
+            // from now rather than from whenever the app went away.
+            self.resetPingClock()
+            self.resumeHangDetection()
         }
 
         // SDK-14: mark that a suspension window has begun, so an
@@ -211,16 +264,25 @@ final class iOSHealthTracker {
             self.pingLock.lock()
             self.appWasBackgrounded = true
             self.pingLock.unlock()
+
+            // IOS-01: nothing on screen, nothing to freeze. Stop sampling
+            // entirely rather than keeping a 4 Hz background-queue timer alive
+            // for the whole time the app sits in the background.
+            self.suspendHangDetection()
         }
 
         observers = [memObs, lpObs, thermalObs, activeObs, bgObs]
+        startMainThreadObserver()
         startHangDetection()
         OrionLogger.debug("iOSHealthTracker: Initialized")
     }
 
     private func resetPingClock() {
         pingLock.lock()
-        lastMainThreadPing = Date()
+        lastMainThreadActivity = ProcessInfo.processInfo.systemUptime
+        // Assume idle until the observer says otherwise. Erring this way means
+        // a missed observation produces no hang rather than a phantom one.
+        mainThreadIdle     = true
         // Any hang measurement spanning the reset is invalid.
         hangInProgress     = false
         hangMaxGapMs       = 0
@@ -245,22 +307,138 @@ final class iOSHealthTracker {
         pingLock.unlock()
     }
 
+    // MARK: - Main-thread activity observer
+
+    private var runLoopObserver: CFRunLoopObserver?
+
+    /// False when the observer could not be installed, in which case the
+    /// detector falls back to the pre-1.2.32 main-queue ping.
+    ///
+    /// Guarded by `pingLock`: written on the main thread by
+    /// startMainThreadObserver()/shutdown(), read by the detector on the
+    /// utility queue on every tick.
+    private var usingRunLoopObserver = false
+
+    /// Install a CFRunLoopObserver on the main run loop.
+    ///
+    /// This is the whole of the IOS-01 fix. A run-loop observer is invoked
+    /// from inside the run loop's own cycle, so it executes only when the main
+    /// thread is already awake and doing something — it never causes a wakeup,
+    /// and on a genuinely idle app it does not run at all.
+    ///
+    /// Registered in `.commonModes` rather than `.defaultMode` so it keeps
+    /// observing during UITrackingRunLoopMode. That matters: hangs while the
+    /// user is dragging a scroll view are the ones people actually feel, and a
+    /// defaultMode-only observer would go silent for the whole gesture and
+    /// report every scroll as a hang.
+    @discardableResult
+    private func startMainThreadObserver() -> Bool {
+        if runLoopObserver != nil {
+            pingLock.lock()
+            let active = usingRunLoopObserver
+            pingLock.unlock()
+            return active
+        }
+
+        // beforeSources is the load-bearing one: CFRunLoop fires it at the top
+        // of every iteration, including iterations where there is already work
+        // pending and the loop never sleeps (in which case beforeWaiting and
+        // afterWaiting are both skipped). It is therefore the only reliable
+        // per-cycle heartbeat, and without it a busy-but-healthy app that
+        // never idles would look permanently hung.
+        //
+        // beforeWaiting carries the idle signal. afterWaiting tightens the
+        // timestamp on the wake edge.
+        //
+        // beforeTimers is deliberately NOT observed: it fires microseconds
+        // before beforeSources in the same iteration, so it would add a main-
+        // thread lock acquisition per cycle and tell us nothing new. This is a
+        // fix for main-thread overhead — it should not add avoidable work of
+        // its own.
+        let activities: CFOptionFlags =
+              CFRunLoopActivity.afterWaiting.rawValue
+            | CFRunLoopActivity.beforeSources.rawValue
+            | CFRunLoopActivity.beforeWaiting.rawValue
+
+        let created: CFRunLoopObserver? = CFRunLoopObserverCreateWithHandler(
+            kCFAllocatorDefault,
+            activities,
+            true,            // repeats
+            CFIndex.min      // run ahead of other observers
+        ) { [weak self] _, activity in
+            guard let self = self else { return }
+            // Runs on the main thread, up to three times per run-loop cycle,
+            // so it must stay trivial: one clock read and two guarded writes.
+            // No allocation, no logging, no Date().
+            //
+            // pingLock is held here for the duration of two field stores —
+            // tens of nanoseconds. The detector's critical sections on the
+            // utility queue are the same size, so the window in which a
+            // background thread could hold this lock against the main thread
+            // is far too small to matter in practice. Kept as a lock rather
+            // than assuming word-sized stores are atomic, which the language
+            // does not guarantee.
+            let now = ProcessInfo.processInfo.systemUptime
+            self.pingLock.lock()
+            self.lastMainThreadActivity = now
+            self.mainThreadIdle = (activity == .beforeWaiting)
+            self.pingLock.unlock()
+        }
+
+        guard let observer = created else {
+            OrionLogger.debug("iOSHealthTracker: run-loop observer unavailable, falling back to ping")
+            pingLock.lock()
+            usingRunLoopObserver = false
+            pingLock.unlock()
+            return false
+        }
+
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+        runLoopObserver = observer
+
+        pingLock.lock()
+        usingRunLoopObserver = true
+        pingLock.unlock()
+        return true
+    }
+
     // MARK: - Hang Detection
 
     private var hangDetectorTimer: DispatchSourceTimer?
+    /// Guarded by `pingLock`. DispatchSourceTimer suspend/resume must balance
+    /// exactly — an unbalanced resume traps, and releasing a suspended source
+    /// crashes — so the state is tracked rather than inferred.
+    private var timerSuspended = false
 
     private func startHangDetection() {
-        hangDetectorTimer?.cancel()
+        teardownHangDetection()
+
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-        timer.schedule(deadline: .now() + pingInterval, repeating: pingInterval)
+        // Leeway lets the OS coalesce this with other timers instead of
+        // demanding a wakeup at an exact instant. It costs nothing in
+        // accuracy: hang durations are measured from observed timestamps, not
+        // counted in ticks, so leeway only widens worst-case detection latency
+        // from 250 ms to ~350 ms — still well inside the 500 ms threshold.
+        timer.schedule(deadline:  .now() + pingInterval,
+                       repeating: pingInterval,
+                       leeway:    .milliseconds(100))
         timer.setEventHandler { [weak self] in
             guard let self = self else { return }
 
             self.pingLock.lock()
-            let lastPing = self.lastMainThreadPing
+            let lastActivity = self.lastMainThreadActivity
+            let idle         = self.mainThreadIdle
+            let observing    = self.usingRunLoopObserver
             self.pingLock.unlock()
 
-            let gap = Date().timeIntervalSince(lastPing)
+            // An idle run loop is a healthy one — it is parked in its wait
+            // state and will service work the instant it arrives, so however
+            // long it has been sitting there, the gap is not a hang. Treating
+            // it as zero also closes out any hang that ended by the app simply
+            // going quiet, via the recovery branch below.
+            let gap: TimeInterval = (observing && idle)
+                ? 0
+                : ProcessInfo.processInfo.systemUptime - lastActivity
 
             if gap > self.hangThreshold {
                 self.pingLock.lock()
@@ -300,10 +478,12 @@ final class iOSHealthTracker {
                     self.pingLock.unlock()
                 }
             } else {
-                // Main thread serviced the ping again — if a hang was in
-                // progress it has now ended. Record exactly one entry using
-                // the longest gap observed, accurate to within one ping
-                // interval (250 ms).
+                // Main thread is moving again — either it reached the run
+                // loop's wait state, or it cycled recently enough to be under
+                // the threshold. If a hang was in progress it has now ended.
+                // Record exactly one entry using the longest gap observed,
+                // accurate to within one sampling interval (250 ms, plus up
+                // to 100 ms of timer leeway).
                 self.pingLock.lock()
                 let wasInHang = self.hangInProgress
                 let duration  = self.hangMaxGapMs
@@ -318,16 +498,72 @@ final class iOSHealthTracker {
                 }
             }
 
-            // Ping the main thread — write under pingLock.
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                self.pingLock.lock()
-                self.lastMainThreadPing = Date()
-                self.pingLock.unlock()
+            // IOS-01: with the observer installed there is nothing to do here.
+            // The main thread reports its own liveness as a side effect of
+            // work it was already doing, so the SDK never wakes it.
+            //
+            // The ping survives only as the fallback for the case where the
+            // observer could not be created, which should not happen on a
+            // normal UIKit app but must not leave hang detection dead.
+            if !observing {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    let now = ProcessInfo.processInfo.systemUptime
+                    self.pingLock.lock()
+                    self.lastMainThreadActivity = now
+                    self.pingLock.unlock()
+                }
             }
         }
         timer.resume()
+
+        pingLock.lock()
+        timerSuspended = false
+        pingLock.unlock()
+
         hangDetectorTimer = timer
+    }
+
+    /// Stop sampling while the app is backgrounded.
+    private func suspendHangDetection() {
+        guard let timer = hangDetectorTimer else { return }
+        pingLock.lock()
+        let alreadySuspended = timerSuspended
+        timerSuspended = true
+        pingLock.unlock()
+
+        if !alreadySuspended { timer.suspend() }
+    }
+
+    private func resumeHangDetection() {
+        guard let timer = hangDetectorTimer else { return }
+        pingLock.lock()
+        let wasSuspended = timerSuspended
+        timerSuspended = false
+        pingLock.unlock()
+
+        if wasSuspended { timer.resume() }
+    }
+
+    /// Cancel and release the timer safely.
+    ///
+    /// A suspended DispatchSourceTimer must be resumed before it is released —
+    /// deallocating one while suspended is a hard crash in libdispatch
+    /// ("Release of a suspended object"). Since 1.2.32 the timer really can be
+    /// suspended at teardown time (backgrounded app, then shutdown), so this
+    /// has to be ordered rather than a bare cancel().
+    private func teardownHangDetection() {
+        guard let timer = hangDetectorTimer else { return }
+        hangDetectorTimer = nil
+
+        pingLock.lock()
+        let wasSuspended = timerSuspended
+        timerSuspended = false
+        pingLock.unlock()
+
+        timer.setEventHandler {}
+        timer.cancel()
+        if wasSuspended { timer.resume() }
     }
 
     private func recordHang(durationMs: Int,
@@ -542,7 +778,15 @@ final class iOSHealthTracker {
     func shutdown() {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers.removeAll()
-        hangDetectorTimer?.cancel()
-        hangDetectorTimer = nil
+
+        if let observer = runLoopObserver {
+            CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes)
+            runLoopObserver = nil
+            pingLock.lock()
+            usingRunLoopObserver = false
+            pingLock.unlock()
+        }
+
+        teardownHangDetection()
     }
 }

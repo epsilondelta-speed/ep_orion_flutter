@@ -105,6 +105,23 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
 
             SessionManager.initialize()
             SendData.startNetworkMonitor()
+
+            // IOS-03: capture the main-thread-only UIKit values (UIScreen
+            // geometry, UIDevice version and vendor id) while we are provably
+            // on the main thread. Every later reader — including the uncaught
+            // exception handler and MetricKit's background queue — serves them
+            // from this snapshot instead of touching UIKit off-thread.
+            //
+            // Must precede warmCaches(), which reads the captured vendor id
+            // from a background queue.
+            AppMetrics.shared.prepareOnMainThread()
+
+            // IOS-02: probe the filesystem-backed device facts (jailbreak
+            // status, disk usage) once, on a background queue, so the beacon
+            // path never performs a syscall on the main thread. This method
+            // runs on the platform thread — which on iOS IS the main thread —
+            // so the work must not be done inline here either.
+            AppMetrics.shared.warmCaches()
             MemoryMetricsTracker.shared.initialize()
             BatteryMetricsTracker.shared.initialize()
             WakeLockTracker.shared.initialize()

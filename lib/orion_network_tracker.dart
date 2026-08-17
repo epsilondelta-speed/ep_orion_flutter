@@ -12,6 +12,27 @@ class OrionNetworkTracker {
   /// Configurable max number of requests per screen (default: 50)
   static int maxRequestsPerScreen = 50;
 
+  /// Max number of screens retained at once (DART-02).
+  ///
+  /// The per-screen request cap bounded each bucket but nothing bounded the
+  /// number of buckets. Entries are only freed by [consumeRequestsForScreen],
+  /// which runs from `_ScreenMetrics.send()` — so any screen that never
+  /// reaches a beacon kept its bucket for the life of the process:
+  ///
+  ///   * dialog and bottom-sheet routes, which are not `PageRoute`s
+  ///   * screens inside a nested Navigator with no `OrionScreenTracker`
+  ///   * the `'UnknownScreen'` fallback used by [OrionHttpOverrides] and
+  ///     [OrionDioInterceptor] before the first route is observed
+  ///
+  /// Each stranded bucket holds up to [maxRequestsPerScreen] request maps
+  /// carrying URL, content type and error strings, so the ceiling was
+  /// unbounded × 50 maps.
+  ///
+  /// Same bound and same eviction as `OrionRageClickTracker._maxScreens`,
+  /// which already solved this — Dart maps preserve insertion order, so
+  /// `keys.first` is the oldest key.
+  static const int _maxScreens = 50;
+
   // ── SDK-internal URL prefixes that must never appear in client beacons ────
   // The sampling CDN fetch and the beacon endpoint itself are internal to the
   // SDK — including them in the network waterfall would be misleading and would
@@ -48,6 +69,17 @@ class OrionNetworkTracker {
       // ✅ Filter out SDK-internal URLs so they never appear in client beacons.
       final url = request['url'] as String? ?? '';
       if (_isSdkInternalUrl(url)) return;
+
+      // ✅ DART-02: bound the number of screens, not just the requests within
+      //    one. Checked before putIfAbsent so the eviction only fires for a
+      //    genuinely new key — an existing screen must never evict anything.
+      if (!_screenRequests.containsKey(screen) &&
+          _screenRequests.length >= _maxScreens) {
+        final oldestKey = _screenRequests.keys.first;
+        _screenRequests.remove(oldestKey);
+        orionPrint('⚠️ OrionNetworkTracker: max screens limit ($_maxScreens) '
+            'reached, evicted: $oldestKey');
+      }
 
       final list = _screenRequests.putIfAbsent(screen, () => []);
 
