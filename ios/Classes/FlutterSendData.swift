@@ -88,7 +88,10 @@ final class FlutterSendData {
         wentBg:          Bool    = false,
         bgCount:         Int     = 0,
         rageClicks:      [[String: Any]] = [],
-        rageClickCount:  Int     = 0
+        rageClickCount:  Int     = 0,
+        // Resolved {s, sa, crm, cv} from the Dart layer that made this beacon's
+        // send/drop decision. Nil on native-origin beacons — see the cf block below.
+        dartConfigSnapshot: [String: Any]? = nil
     ) {
         MemoryMetricsTracker.shared.onScreenTransition()
 
@@ -153,7 +156,25 @@ final class FlutterSendData {
 
         // cf snapshot — added LAST so nothing else can clobber it. Carries the
         // resolved {s, sa, crm, cv} that produced this beacon.
-        beacon["cf"] = cfSnapshot
+        //
+        // 1.2.33 — cf now reports the config each layer ACTUALLY ACTED UNDER.
+        // The field has two owners:
+        //   s, crm, cv  → Dart. Dart's shouldSend() makes the send/drop call, so
+        //                 Dart's percent and config version produced this beacon.
+        //   sa          → native. filterAnalytics above is applied down here, so
+        //                 native's value is what shaped the network waterfall.
+        //
+        // Dart and native poll the same CDN file on independent timers, so a config
+        // change landing between the two fetches used to give a beacon a cf that was
+        // not the config that produced it. Falls back wholesale to the native
+        // snapshot when Dart sent nothing.
+        var resolvedCf = cfSnapshot
+        if let dartCf = dartConfigSnapshot {
+            if let s   = dartCf["s"]   { resolvedCf["s"]   = s }
+            if let crm = dartCf["crm"] { resolvedCf["crm"] = crm }
+            if let cv  = dartCf["cv"]  { resolvedCf["cv"]  = cv }
+        }
+        beacon["cf"] = resolvedCf
 
         OrionLogger.debug("FlutterSendData: 📤 Sending beacon for '\(screenName)' (filter=\(filterAnalytics))")
 

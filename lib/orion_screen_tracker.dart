@@ -46,6 +46,94 @@ class OrionScreenTracker extends RouteObserver<PageRoute<dynamic>> {
 
   static OrionScreenTracker? get instance => _instance;
 
+  // ── Screen naming ─────────────────────────────────────────────────────────
+
+  /// Optional hook for apps that push routes without a [RouteSettings.name].
+  ///
+  /// Flutter gives a [NavigatorObserver] no access to a route's child widget, so
+  /// the SDK cannot derive a meaningful name for an unnamed route on its own —
+  /// every one of them falls back to `UnnamedRoute(MaterialPageRoute)`, which is
+  /// the identical string for all of them. When that happens, every unnamed
+  /// screen reports under one name and their TTID/TTFD, frame, network and
+  /// rage-click data all merge into a single bucket.
+  ///
+  /// Set this to derive a name yourself, e.g.:
+  ///
+  /// ```dart
+  /// OrionScreenTracker.screenNameExtractor = (route) {
+  ///   final page = route.settings.arguments;
+  ///   return page is String ? page : null;
+  /// };
+  /// ```
+  ///
+  /// Return `null` to fall through to `RouteSettings.name`. Naming the routes
+  /// themselves — `MaterialPageRoute(settings: RouteSettings(name: 'Checkout'))`
+  /// — is preferable where you control them; this exists for the cases where you
+  /// do not. Exceptions thrown here are caught and ignored.
+  static String? Function(Route<dynamic> route)? screenNameExtractor;
+
+  static bool _unnamedRouteWarned = false;
+
+  /// Single source of truth for a route's screen name.
+  ///
+  /// _updateCurrentScreen, _startTracking and _finalizeTracking must all derive
+  /// the SAME string for the same route — a tracker registered under one key and
+  /// removed under another leaks for the life of the process. Until 1.2.33 this
+  /// expression was written out separately in all three places.
+  static String _screenNameFor(Route<dynamic> route) {
+    // Customer-supplied callbacks are guarded independently: the SDK must never
+    // break the host app's navigation because an extractor threw.
+    try {
+      final custom = screenNameExtractor?.call(route);
+      if (custom != null && custom.isNotEmpty) return custom;
+    } catch (e) {
+      orionPrint('⚠️ OrionScreenTracker: screenNameExtractor threw — $e');
+    }
+
+    final named = route.settings.name;
+    if (named != null && named.isNotEmpty) return named;
+
+    _warnUnnamedRouteOnce();
+    return _unnamedFallbackName(route);
+  }
+
+  /// Name for a route that carries no usable name: `UnnamedRoute(MaterialPageRoute)`.
+  ///
+  /// Deliberately self-describing. Until 1.2.33 this returned
+  /// `route.runtimeType.toString()` — literally `"MaterialPageRoute<dynamic>"` —
+  /// which reads in a dashboard like a genuine screen. It is not: every unnamed
+  /// route of that class resolves to it, so the row is an average across all of
+  /// them. Anyone reading a chart should be able to see that at a glance rather
+  /// than spend an afternoon wondering why one screen has terrible TTID.
+  ///
+  /// The generic argument is dropped. It is the route's RETURN type — what
+  /// `Navigator.pop` hands back — so `MaterialPageRoute<String>` and
+  /// `MaterialPageRoute<dynamic>` are the same kind of unnamed route and
+  /// splitting them apart would only invent a distinction that means nothing.
+  static String _unnamedFallbackName(Route<dynamic> route) {
+    final rawType = route.runtimeType.toString();
+    final angle   = rawType.indexOf('<');
+    final base    = angle < 0 ? rawType : rawType.substring(0, angle);
+    return 'UnnamedRoute($base)';
+  }
+
+  /// Debug-only, once per process. orionPrint is kDebugMode-gated, so this
+  /// compiles out of release builds entirely.
+  static void _warnUnnamedRouteOnce() {
+    if (_unnamedRouteWarned) return;
+    _unnamedRouteWarned = true;
+    orionPrint(
+      '⚠️ OrionScreenTracker: a PageRoute was pushed with no '
+          'RouteSettings.name, so it is reported as '
+          '"UnnamedRoute(MaterialPageRoute)" or similar. EVERY unnamed route of '
+          'that class resolves to that same name, so their TTID/TTFD, frame, '
+          'network and rage-click data all merge into one bucket. Fix by naming '
+          'the route — '
+          'MaterialPageRoute(settings: RouteSettings(name: "Checkout"), …) — '
+          'or set OrionScreenTracker.screenNameExtractor.',
+    );
+  }
+
   // ── RouteObserver overrides — all guarded ─────────────────────────────────
 
   @override
@@ -114,7 +202,7 @@ class OrionScreenTracker extends RouteObserver<PageRoute<dynamic>> {
   void _updateCurrentScreen(Route? route) {
     try {
       if (route is PageRoute) {
-        final screenName = route.settings.name ?? route.runtimeType.toString();
+        final screenName = _screenNameFor(route);
         _currentScreenName = screenName;
         OrionNetworkTracker.setCurrentScreen(screenName);
         OrionRageClickTracker.setCurrentScreen(screenName);
@@ -128,7 +216,7 @@ class OrionScreenTracker extends RouteObserver<PageRoute<dynamic>> {
   void _startTracking(Route? route) {
     try {
       if (route is PageRoute) {
-        final screenName = route.settings.name ?? route.runtimeType.toString();
+        final screenName = _screenNameFor(route);
 
         // ✅ Fix #10: finalise any existing tracker for the same screen name
         //    before starting a new one. Without this, the previous tracker is
@@ -161,7 +249,7 @@ class OrionScreenTracker extends RouteObserver<PageRoute<dynamic>> {
   void _finalizeTracking(Route? route) {
     try {
       if (route is PageRoute) {
-        final screenName = route.settings.name ?? route.runtimeType.toString();
+        final screenName = _screenNameFor(route);
         final metrics = _screenMetrics.remove(screenName);
         OrionFlutter.onFlutterScreenStop(screenName);
         metrics?.send();
@@ -267,6 +355,8 @@ class OrionAppLifecycleObserver with WidgetsBindingObserver {
       try {
         OrionFlutter.onAppForeground();
         OrionScreenTracker.onAppCameToForeground();
+        // Restart CDN config polling — see SamplingManager.pauseRefresh().
+        SamplingManager.instance.resumeRefresh();
       } catch (_) {}
     });
   }
@@ -276,6 +366,9 @@ class OrionAppLifecycleObserver with WidgetsBindingObserver {
       try {
         OrionFlutter.onAppBackground();
         OrionScreenTracker.onAppWentToBackground();
+        // Beacons are only assembled in the foreground, so polling the config
+        // while backgrounded is pure network and radio cost.
+        SamplingManager.instance.pauseRefresh();
       } catch (_) {}
     });
   }

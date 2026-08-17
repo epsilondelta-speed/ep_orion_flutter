@@ -208,6 +208,20 @@ class OrionFlutter {
         'bgCount':        bgCount,
         'rageClicks':     rageClicks,
         'rageClickCount': rageClickCount,
+
+        // The config that actually produced this beacon's send/drop decision.
+        //
+        // `cf` exists to record which config a decision was made under, but the
+        // decision is made HERE (shouldSend() above) while native was stamping
+        // `cf` from its OWN independently-fetched copy. Dart and native poll the
+        // same CDN file on separate timers, so a config change landing between
+        // the two fetches produced a beacon whose `cf` was not the config that
+        // produced it — precisely the thing the field is meant to rule out.
+        //
+        // Snapshotting here, a few lines after the roll, makes `cf` truthful by
+        // construction. Native falls back to its own snapshot when this key is
+        // absent, so older hosts and native-origin beacons are unaffected.
+        'cf':             SamplingManager.instance.getConfigSnapshot(),
       });
     } catch (e) {
       orionPrint('trackFlutterScreen error — $e');

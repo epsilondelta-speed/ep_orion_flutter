@@ -88,6 +88,15 @@ class SamplingManager {
   // The interval currently driving _refreshTimer. Used to detect crm changes.
   int     _activeRefreshMin = _defaultRefreshMin;
 
+  // Time since the last SUCCESSFUL CDN fetch, used by resumeRefresh() to decide
+  // whether the config is stale enough to warrant an immediate re-fetch.
+  //
+  // A Stopwatch rather than DateTime.now(): Stopwatch is monotonic, so an NTP
+  // correction or a user changing the device clock mid-session cannot make the
+  // config look arbitrarily stale or fresh. Same reasoning as the 1.2.32 move of
+  // iOS hang timing off the wall clock.
+  final Stopwatch _sinceLastFetch = Stopwatch();
+
   final Random _random = Random();
 
   // ── Init ──────────────────────────────────────────────────────────────────
@@ -215,12 +224,61 @@ class SamplingManager {
       _configLoaded        = false;
       _firstBeaconSent     = false;
       _activeRefreshMin    = _defaultRefreshMin;
+      _sinceLastFetch
+        ..stop()
+        ..reset();
 
       orionPrint('SamplingManager: shutdown');
     } catch (_) {}
   }
 
   // ── Refresh scheduling ────────────────────────────────────────────────────
+
+  /// Stop the periodic CDN refresh while the app is backgrounded.
+  ///
+  /// On Android the Dart isolate keeps running after the app leaves the
+  /// foreground, so `Timer.periodic` kept fetching the config every crm minutes
+  /// for a user who had switched away — network and radio wakeups buying nothing,
+  /// since beacons are only assembled in the foreground.
+  ///
+  /// Safe to call repeatedly. Config values are left intact; only the timer stops.
+  void pauseRefresh() {
+    try {
+      if (_refreshTimer == null) return;
+      _refreshTimer!.cancel();
+      _refreshTimer = null;
+      orionPrint('SamplingManager: refresh paused (backgrounded)');
+    } catch (_) {}
+  }
+
+  /// Restart the periodic refresh on foreground, re-fetching immediately only if
+  /// the config has actually gone stale while backgrounded.
+  ///
+  /// The staleness check is the important part. Foregrounding is a *frequent*
+  /// event — a user switching between apps does it dozens of times an hour — so
+  /// fetching unconditionally here would make ordinary app-switching cost far
+  /// more CDN requests than the always-on timer this replaced, which is the
+  /// opposite of the point. Fetch only when at least one full refresh interval
+  /// has elapsed since the last successful fetch; otherwise just restart the
+  /// timer and let it fire on its own schedule.
+  ///
+  /// No-op when a timer is already live, so a duplicate foreground notification
+  /// cannot stack two timers or trigger a redundant fetch.
+  void resumeRefresh() {
+    try {
+      if (_refreshTimer != null) return;
+      _scheduleRefresh(_activeRefreshMin);
+
+      // Not running => no successful fetch yet, so there is nothing to be fresh.
+      final stale = !_sinceLastFetch.isRunning ||
+          _sinceLastFetch.elapsed >= Duration(minutes: _activeRefreshMin);
+
+      orionPrint('SamplingManager: refresh resumed (foregrounded), '
+          'stale=$stale');
+
+      if (stale) _fetchConfig();
+    } catch (_) {}
+  }
 
   void _scheduleRefresh(int minutes) {
     try {
@@ -272,6 +330,13 @@ class SamplingManager {
       _remoteRefreshMin    = _resolveRefreshMin(json);
       _remoteConfigVersion = _resolveConfigVersion(json);
       _configLoaded        = true;
+
+      // Restart the staleness clock. Only on success — a timeout or a non-200
+      // must leave the config looking stale so the next foreground retries
+      // rather than sitting on a value we failed to confirm.
+      _sinceLastFetch
+        ..reset()
+        ..start();
 
       orionPrint(
         'SamplingManager: config loaded — '

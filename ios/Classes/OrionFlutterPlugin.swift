@@ -340,6 +340,9 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
             let bgCount        = args["bgCount"]        as? Int ?? 0
             let rageClicks     = args["rageClicks"]     as? [[String: Any]] ?? []
             let rageClickCount = args["rageClickCount"] as? Int ?? 0
+            // Resolved sampling config from the Dart layer that made this beacon's
+            // send/drop decision (1.2.33). Absent on older hosts.
+            let dartCfSnapshot = args["cf"] as? [String: Any]
 
             OrionLogger.debug("OrionFlutterPlugin: trackFlutterScreen — '\(screenName)' rageClicks=\(rageClickCount)")
 
@@ -355,7 +358,8 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
                 wentBg:          wentBg,
                 bgCount:         bgCount,
                 rageClicks:      rageClicks,
-                rageClickCount:  rageClickCount
+                rageClickCount:  rageClickCount,
+                dartConfigSnapshot: dartCfSnapshot
             )
             result("screen_tracked")
         } catch {
