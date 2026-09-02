@@ -1,3 +1,6 @@
+## 1.2.35
+Android ANR fixes: battery receiver registration and start-type detection moved off the main thread
+
 ## 1.2.34
 Android native bug fix 
 
