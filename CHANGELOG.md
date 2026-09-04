@@ -1,3 +1,17 @@
+## 1.2.36
+Android main-thread and memory reductions; improved app-lifecycle handling. The Dio
+interceptor now namespaces its key in `RequestOptions.extra` so it cannot collide with
+the host app's own metadata.
+
+Registering a lifecycle observer is no longer required — `initializeEdOrion()` does it
+for you. Existing calls to `OrionAppLifecycleObserver.initialize()` remain safe and
+become a no-op.
+
+⚠️ Dashboards: on Android, TTFD is now a real measurement on slower devices, where it
+previously fell back to the 5 s cap. Expect `ttfd90` to drop sharply after upgrading and
+re-baseline any alerts on it. Per-screen network request counts may also rise where the
+interceptor key had been colliding.
+
 ## 1.2.35
 Android ANR fixes: battery receiver registration and start-type detection moved off the main thread
 
