@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
+import 'dart:async';
 import 'package:flutter/scheduler.dart';
 import 'orion_flutter.dart';
 import 'orion_network_tracker.dart';
 import 'orion_logger.dart';
 import 'orion_frame_metrics.dart';
 import 'orion_rage_click_tracker.dart';
-import 'orion_sampling_manager.dart';
+import 'orion_beacon_guard.dart';
+import 'orion_lifecycle.dart';
 
 /// RouteObserver with comprehensive frame tracking and interaction-aware TTFD.
 ///
@@ -331,90 +333,27 @@ class OrionInteractionDetector extends StatelessWidget {
 // OrionAppLifecycleObserver
 // ─────────────────────────────────────────────────────────────────────────────
 
-class OrionAppLifecycleObserver with WidgetsBindingObserver {
-  static OrionAppLifecycleObserver? _instance;
-  static bool _isInForeground = true;
-
+/// Retained for source compatibility. All behaviour now lives in
+/// [OrionLifecycle], which is the SDK's single observer — see that class for
+/// why there is only one.
+///
+/// As of 1.2.36 calling this is OPTIONAL: `initializeEdOrion` registers the
+/// observer itself. Both entry points share one instance, so a host that calls
+/// this as well gets a no-op rather than a second registration.
+class OrionAppLifecycleObserver {
   OrionAppLifecycleObserver._();
 
   static void initialize() {
     try {
-      if (_instance == null) {
-        _instance = OrionAppLifecycleObserver._();
-        WidgetsBinding.instance.addObserver(_instance!);
-        orionPrint('🔋 OrionAppLifecycleObserver initialized');
-        _notifyForegroundAsync();
-      }
+      OrionLifecycle.ensureRegistered();
     } catch (e) {
       orionPrint('⚠️ OrionAppLifecycleObserver: initialize error: $e');
     }
   }
 
-  static void _notifyForegroundAsync() {
-    Future.microtask(() {
-      try {
-        OrionFlutter.onAppForeground();
-        OrionScreenTracker.onAppCameToForeground();
-        // Restart CDN config polling — see SamplingManager.pauseRefresh().
-        SamplingManager.instance.resumeRefresh();
-      } catch (_) {}
-    });
-  }
+  static void dispose() => OrionLifecycle.dispose();
 
-  static void _notifyBackgroundAsync() {
-    Future.microtask(() {
-      try {
-        OrionFlutter.onAppBackground();
-        OrionScreenTracker.onAppWentToBackground();
-        // Beacons are only assembled in the foreground, so polling the config
-        // while backgrounded is pure network and radio cost.
-        SamplingManager.instance.pauseRefresh();
-      } catch (_) {}
-    });
-  }
-
-  static void dispose() {
-    try {
-      if (_instance != null) {
-        WidgetsBinding.instance.removeObserver(_instance!);
-        _instance = null;
-      }
-    } catch (_) {}
-  }
-
-  static bool get isInForeground => _isInForeground;
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    try {
-      switch (state) {
-        case AppLifecycleState.resumed:
-          if (!_isInForeground) {
-            _isInForeground = true;
-            orionPrint('🔋 App resumed (foreground)');
-            _notifyForegroundAsync();
-          }
-          break;
-        case AppLifecycleState.paused:
-        case AppLifecycleState.inactive:
-          if (_isInForeground) {
-            _isInForeground = false;
-            orionPrint('🔋 App paused (background)');
-            _notifyBackgroundAsync();
-          }
-          break;
-        case AppLifecycleState.detached:
-        case AppLifecycleState.hidden:
-          if (_isInForeground) {
-            _isInForeground = false;
-            _notifyBackgroundAsync();
-          }
-          break;
-      }
-    } catch (e) {
-      orionPrint('⚠️ OrionAppLifecycleObserver: state change error: $e');
-    }
-  }
+  static bool get isInForeground => OrionLifecycle.isInForeground;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -443,6 +382,15 @@ class _ScreenMetrics {
   static const int    _requiredStableFrames = 3;
   static const int    _maxFrameDuration     = 16;
   static const int    _ttfdTimeoutMs        = 5000;
+
+  // ── TTFD detection state (1.2.36) ────────────────────────────────────
+  // _settleTimer detects "no frames for a while"; _ttfdTimeoutTimer is the
+  // hard cap. Both are cancelled on capture and on send(), so a screen that is
+  // finalized mid-detection leaves nothing running.
+  Timer?             _settleTimer;
+  Timer?             _ttfdTimeoutTimer;
+  int                _lastFrameElapsed     = -1;
+  static const int   _settleWindowMs       = 200;
   int? _lastFrameTime;
 
   bool _disposed = false;
@@ -497,12 +445,23 @@ class _ScreenMetrics {
     });
   }
 
+  /// Passive TTFD detection (1.2.36).
+  ///
+  /// scheduleFrameCallback's `scheduleNewFrame` defaults to true and its
+  /// first statement is scheduleFrame(), so the previous self-rescheduling
+  /// loop REQUESTED a vsync on every frame and held the engine at full
+  /// refresh rate until TTFD was captured or the 5 s cap hit. That is the
+  /// same forced-render-loop the frame tracker was moved off in 1.2.32; the
+  /// TTFD path was missed at the time. It violates the invariant that frame
+  /// metrics observe and never drive.
   void _startTTFDTracking() {
     if (OrionScreenTracker._hasManualTTFD(screenName)) {
       _startManualTTFDTracking();
-    } else {
-      SchedulerBinding.instance.scheduleFrameCallback(_onFrame);
+      return;
     }
+    _armTTFDTimeout();
+    SchedulerBinding.instance
+        .scheduleFrameCallback(_onFrame, scheduleNewFrame: false);
   }
 
   void _startManualTTFDTracking() {
@@ -532,24 +491,14 @@ class _ScreenMetrics {
   void _onFrame(Duration timestamp) {
     if (_disposed || _ttfdCaptured) return;
     final currentTime = timestamp.inMilliseconds;
-
-    if (_stopwatch.elapsedMilliseconds > _ttfdTimeoutMs) {
-      _ttfd        = _stopwatch.elapsedMilliseconds;
-      _ttfdCaptured = true;
-      _ttfdSource  = 'timeout';
-      orionPrint('⚠️ [$screenName] TTFD timeout: $_ttfd ms');
-      return;
-    }
+    _lastFrameElapsed = _stopwatch.elapsedMilliseconds;
 
     if (_lastFrameTime != null) {
       final frameDuration = currentTime - _lastFrameTime!;
       if (frameDuration <= _maxFrameDuration) {
         _stableFrameCount++;
         if (_stableFrameCount >= _requiredStableFrames) {
-          _ttfd        = _stopwatch.elapsedMilliseconds;
-          _ttfdCaptured = true;
-          _ttfdSource  = 'stable_frames';
-          orionPrint('✅ [$screenName] TTFD (stable): $_ttfd ms');
+          _captureTTFD(_stopwatch.elapsedMilliseconds, 'stable_frames');
           return;
         }
       } else {
@@ -558,14 +507,75 @@ class _ScreenMetrics {
     }
 
     _lastFrameTime = currentTime;
-    if (!_ttfdCaptured) {
-      SchedulerBinding.instance.scheduleFrameCallback(_onFrame);
-    }
+
+    // Settle detection. If no further frame arrives within _settleWindowMs the
+    // screen has stopped changing, which is what TTFD is actually asking. We
+    // report the LAST OBSERVED frame's elapsed time rather than the moment the
+    // timer fired, so TTFD does not carry the window length as a constant
+    // offset. The timer is restarted on every frame, so a screen that is still
+    // painting keeps pushing it out.
+    _settleTimer?.cancel();
+    _settleTimer = Timer(const Duration(milliseconds: _settleWindowMs), () {
+      // A screen cannot be "fully drawn" before it has been drawn at all.
+      // _onFrame is a TRANSIENT callback — it runs at the START of a frame —
+      // while TTID is captured in that same frame's post-frame callback. On a
+      // slow device a single heavy frame can outlast the settle window, so
+      // firing here would report the frame's start as TTFD and produce a TTFD
+      // that precedes TTID. Measured on a low-end device before this guard: 51
+      // of 61 beacons inverted. Wait for the frame to finish; the 5 s cap
+      // bounds this, so it cannot spin forever.
+      if (!_ttidCaptured) {
+        _settleTimer = Timer(const Duration(milliseconds: _settleWindowMs), () {
+          _captureTTFD(_lastFrameElapsed, 'settled');
+        });
+        return;
+      }
+      _captureTTFD(_lastFrameElapsed, 'settled');
+    });
+
+    // scheduleNewFrame: false — observe, never drive. See _startTTFDTracking.
+    SchedulerBinding.instance
+        .scheduleFrameCallback(_onFrame, scheduleNewFrame: false);
+  }
+
+  /// Records TTFD exactly once and shuts down both TTFD timers.
+  void _captureTTFD(int elapsedMs, String source) {
+    if (_disposed || _ttfdCaptured) return;
+    // Belt and braces for the ordering described on the settle timer: TTFD is
+    // never allowed to precede TTID. Downstream treats ttid > ttfd as a bogus
+    // TTFD and substitutes ttid + 50, so an inverted value is not merely odd —
+    // it silently discards the measurement.
+    _ttfd         = (_ttidCaptured && elapsedMs < _ttid) ? _ttid : elapsedMs;
+    _ttfdCaptured = true;
+    _ttfdSource   = source;
+    _cancelTTFDTimers();
+    orionPrint('✅ [$screenName] TTFD ($source): $_ttfd ms');
+  }
+
+  void _cancelTTFDTimers() {
+    _settleTimer?.cancel();
+    _settleTimer = null;
+    _ttfdTimeoutTimer?.cancel();
+    _ttfdTimeoutTimer = null;
+  }
+
+  /// Hard cap on TTFD, driven by a Timer rather than from inside _onFrame.
+  ///
+  /// The old implementation checked the 5 s cap at the top of the frame
+  /// callback, which only worked because that callback FORCED a vsync every
+  /// frame. With passive observation an idle screen delivers no callbacks at
+  /// all, so a cap living in the frame path could never fire.
+  void _armTTFDTimeout() {
+    _ttfdTimeoutTimer?.cancel();
+    _ttfdTimeoutTimer = Timer(const Duration(milliseconds: _ttfdTimeoutMs), () {
+      _captureTTFD(_stopwatch.elapsedMilliseconds, 'timeout');
+    });
   }
 
   void send() {
     if (!OrionFlutter.isSupported || _disposed) return;
     _disposed = true;
+    _cancelTTFDTimers();
 
     // ⚠️ Reverted from addPostFrameCallback back to Future.delayed.
     //    addPostFrameCallback only fires when a frame is drawn — if the app
@@ -594,6 +604,20 @@ class _ScreenMetrics {
         final rageClicks     = OrionRageClickTracker.getRageClicksJson(screenName);
         final rageClickCount = OrionRageClickTracker.getRageClickCount(screenName);
         OrionRageClickTracker.clearScreen(screenName);
+
+        // 1.2.36 — same empty-beacon guard as OrionManualTracker; see the full
+        // rationale on the matching block in orion_manual_screen_tracker.dart.
+        // Kept identical in both trackers deliberately: one predicate, one
+        // behaviour, so the two paths cannot drift.
+        if (shouldSuppressEmptyBeacon(
+          ttid:           _ttid,
+          totalFrames:    frameMetrics.totalFrames,
+          networkCount:   networkData.length,
+          rageClickCount: rageClickCount,
+        )) {
+          orionPrint('⏭️ [$screenName] No data collected — suppressing empty beacon');
+          return;
+        }
 
         orionPrint(
           '📤 [$screenName] Sending beacon — '

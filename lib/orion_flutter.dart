@@ -5,6 +5,7 @@ import 'orion_flutter_platform_interface.dart';
 import 'orion_sampling_manager.dart';
 import 'orion_http_overrides.dart';
 import 'orion_cold_start.dart';
+import 'orion_lifecycle.dart';
 import 'orion_logger.dart';
 
 export 'orion_wake_lock.dart';
@@ -50,6 +51,11 @@ class OrionFlutter {
       // internally; a no-op on iOS and safe if the binding isn't ready.
       OrionColdStart.armFirstFrameMark();
 
+      // Lifecycle (1.2.36): register the observer ourselves rather than relying
+      // on the host to remember. See OrionLifecycle for what a host that
+      // registered nothing was silently losing.
+      _autoRegisterLifecycle();
+
       return await _channel.invokeMethod<String>('initializeEdOrion', {
         'cid': cid,
         'pid': pid,
@@ -65,6 +71,38 @@ class OrionFlutter {
       orionPrint('initializeEdOrion error — $e');
       return null;
     }
+  }
+
+  /// Registers [OrionLifecycle], retrying once on the microtask queue.
+  ///
+  /// `WidgetsBinding.instance` throws when a host calls [initializeEdOrion]
+  /// before `WidgetsFlutterBinding.ensureInitialized()`. Swallowing that — the
+  /// best-effort pattern used elsewhere in the SDK — is the wrong call here: a
+  /// missing observer is precisely the silent data loss this auto-registration
+  /// exists to prevent.
+  ///
+  /// The retry is a microtask rather than a timer because `main()` runs to
+  /// completion — including `runApp()`, which initialises the binding — before
+  /// the microtask queue drains. So the deferred attempt lands with the binding
+  /// up in any normal app, without guessing at a delay.
+  ///
+  /// We deliberately do NOT call `WidgetsFlutterBinding.ensureInitialized()`
+  /// ourselves: initialising the host's binding is not the SDK's decision to
+  /// make, and the invariant is that Orion never changes host behaviour.
+  static void _autoRegisterLifecycle() {
+    try {
+      OrionLifecycle.ensureRegistered();
+      return;
+    } catch (_) {
+      // Binding not up yet — fall through to the deferred attempt.
+    }
+    Future.microtask(() {
+      try {
+        OrionLifecycle.ensureRegistered();
+      } catch (e) {
+        orionPrint('⚠️ [Orion] Lifecycle observer not registered: $e');
+      }
+    });
   }
 
   static Future<String?> getPlatformVersion() {

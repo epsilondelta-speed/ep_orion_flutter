@@ -35,7 +35,14 @@ class OrionDioInterceptor extends Interceptor {
   void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
     try {
       if (OrionFlutter.isSupported && SamplingManager.instance.isTrackingEnabled) {
-        options.extra['startTime'] = DateTime.now().millisecondsSinceEpoch;
+        // 1.2.36 — key is `orion_` prefixed. RequestOptions.extra is the HOST's
+        // metadata map, not ours; an unprefixed 'startTime' collides with any
+        // app that uses the same obvious name. Observed at a customer running
+        // trackAllHttp: true — their String value hit our `as int?` below and
+        // threw "type 'String' is not a subtype of type 'int?' in type cast",
+        // dropping the record, while our write clobbered theirs on every
+        // tracked request. Never write an unprefixed key into extra.
+        options.extra['orion_startTime'] = DateTime.now().millisecondsSinceEpoch;
         if (verbose) {
           orionPrint('🌐 [Orion] Request: ${options.method} ${options.uri}');
         }
@@ -154,7 +161,7 @@ class OrionDioInterceptor extends Interceptor {
       // but kept here too so any future caller is safe.
       if (!SamplingManager.instance.isTrackingEnabled) return;
 
-      final startTime = options.extra['startTime'] as int?;
+      final startTime = options.extra['orion_startTime'] as int?;
       final endTime   = DateTime.now().millisecondsSinceEpoch;
 
       if (startTime == null) {
