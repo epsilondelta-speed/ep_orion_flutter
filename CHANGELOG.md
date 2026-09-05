@@ -1,3 +1,14 @@
+## 1.2.37
+TTFD fix. On devices that paint quickly, 1.2.36 reported TTFD as the 5 s timeout value
+instead of a real measurement, on both iOS and Android. **Please upgrade straight to
+1.2.37 and skip 1.2.36.**
+
+Also moves a class load off the main thread during initialisation on Android.
+
+⚠️ Dashboards: TTFD changes again with this release and returns to roughly the range
+1.2.35 reported on iOS. If you annotated your dashboards for 1.2.36, add a second
+annotation here. The Android note below still applies.
+
 ## 1.2.36
 Android main-thread and memory reductions; improved app-lifecycle handling. The Dio
 interceptor now namespaces its key in `RequestOptions.extra` so it cannot collide with
