@@ -391,7 +391,8 @@ class _ScreenMetrics {
   Timer?             _ttfdTimeoutTimer;
   int                _lastFrameElapsed     = -1;
   static const int   _settleWindowMs       = 200;
-  int? _lastFrameTime;
+  bool               _timingsListening     = false;
+  int                _ttfdFrameCount       = 0;
 
   bool _disposed = false;
 
@@ -460,8 +461,10 @@ class _ScreenMetrics {
       return;
     }
     _armTTFDTimeout();
-    SchedulerBinding.instance
-        .scheduleFrameCallback(_onFrame, scheduleNewFrame: false);
+    // 1.2.37 — arm the settle timer here as well, not only from _onFrame:
+    // with passive registration _onFrame may never run. See _armSettleTimer.
+    _armSettleTimer();
+    _startTimingsObservation();
   }
 
   void _startManualTTFDTracking() {
@@ -488,54 +491,122 @@ class _ScreenMetrics {
     Future.delayed(const Duration(milliseconds: 50), _pollForManualTTFD);
   }
 
-  void _onFrame(Duration timestamp) {
+  /// Passive frame observation for TTFD (1.2.37).
+  ///
+  /// Was scheduleFrameCallback. A transient frame callback fires only if a
+  /// frame is ALREADY scheduled, and since 1.2.36 it is registered with
+  /// scheduleNewFrame: false so we never request one — which means on any app
+  /// that is not continuously animating it fires once at most and then goes
+  /// silent. Measured on a vivo V2111 across 15 beacons: it ran 0 or 1 times
+  /// per screen and NEVER after TTID, so _lastFrameElapsed was always below
+  /// _ttid, _captureTTFD's clamp pulled every value up, and TTFD was
+  /// structurally incapable of exceeding TTID. OrionFrameTracker saw 4 real
+  /// frames on those same screens, so the frames existed — we just could not
+  /// see them. Against production 1.2.25 (HealthKart, 58.5k requests) TTFD is
+  /// 134 ms median against a 10 ms first paint, so a TTFD equal to TTID is a
+  /// lost measurement, not a fast screen.
+  ///
+  /// addTimingsCallback is what OrionFrameTracker already uses and what the
+  /// 1.2.32 "observe, never drive" invariant asks for: it reports frames the
+  /// engine has FINISHED rasterizing, requests nothing, and an idle screen
+  /// simply produces none.
+  ///
+  /// Delivery is batched and can lag the frame slightly, so _lastFrameElapsed
+  /// is taken at delivery time rather than from the engine clock — mixing the
+  /// engine timebase with our Stopwatch would be worse than a few ms of lag.
+  void _onTimings(List<FrameTiming> timings) {
     if (_disposed || _ttfdCaptured) return;
-    final currentTime = timestamp.inMilliseconds;
-    _lastFrameElapsed = _stopwatch.elapsedMilliseconds;
-
-    if (_lastFrameTime != null) {
-      final frameDuration = currentTime - _lastFrameTime!;
+    for (final timing in timings) {
+      _ttfdFrameCount++;
+      final frameDuration = timing.totalSpan.inMilliseconds;
       if (frameDuration <= _maxFrameDuration) {
         _stableFrameCount++;
         if (_stableFrameCount >= _requiredStableFrames) {
-          _captureTTFD(_stopwatch.elapsedMilliseconds, 'stable_frames');
+          _lastFrameElapsed = _stopwatch.elapsedMilliseconds;
+          _captureTTFD(_lastFrameElapsed, 'stable_frames');
           return;
         }
       } else {
         if (frameDuration > 32) _stableFrameCount = 0;
       }
     }
+    _lastFrameElapsed = _stopwatch.elapsedMilliseconds;
 
-    _lastFrameTime = currentTime;
+    // Settle detection — restarted on every batch, so a screen that is still
+    // painting keeps pushing the window out. See _armSettleTimer.
+    _armSettleTimer();
+  }
 
-    // Settle detection. If no further frame arrives within _settleWindowMs the
-    // screen has stopped changing, which is what TTFD is actually asking. We
-    // report the LAST OBSERVED frame's elapsed time rather than the moment the
-    // timer fired, so TTFD does not carry the window length as a constant
-    // offset. The timer is restarted on every frame, so a screen that is still
-    // painting keeps pushing it out.
+  void _startTimingsObservation() {
+    if (_timingsListening) return;
+    try {
+      SchedulerBinding.instance.addTimingsCallback(_onTimings);
+      _timingsListening = true;
+    } catch (_) {
+      // Binding not ready — the 5 s cap still bounds TTFD. Never throw at the host.
+    }
+  }
+
+  void _stopTimingsObservation() {
+    if (!_timingsListening) return;
+    _timingsListening = false;
+    try {
+      SchedulerBinding.instance.removeTimingsCallback(_onTimings);
+    } catch (_) {}
+  }
+
+  /// The value the settle path reports: the last frame we actually observed,
+  /// or TTID when no frame ever arrived. An idle screen stopped changing at
+  /// first paint, so TTID *is* its fully-drawn time. _captureTTFD's clamp would
+  /// coerce a -1 up to TTID anyway; naming it here makes that intentional
+  /// rather than incidental.
+  int get _settledElapsed => _lastFrameElapsed >= 0 ? _lastFrameElapsed : _ttid;
+
+  /// Arms, or re-arms, the settle timer.
+  ///
+  /// Called from two places, and the second is the 1.2.37 fix:
+  ///
+  ///   * from _onFrame, cancelling and restarting on every frame, so a screen
+  ///     that is still painting keeps pushing the window out;
+  ///   * ONCE from _startTTFDTracking — because _onFrame may never run at all.
+  ///
+  /// Since 1.2.36 the frame callback is registered PASSIVELY
+  /// (scheduleNewFrame: false), so it fires only on a frame something else
+  /// schedules. A screen that finishes painting before registration and then
+  /// goes idle delivers no callback ever, and the settle timer — which lived
+  /// only inside _onFrame — was therefore never armed at all, leaving the 5 s
+  /// cap and 'finalize' as the only reachable outcomes.
+  ///
+  /// Measured on an iPhone 14 against published 1.2.36: 1 of 100 beacons
+  /// reached 'settled', 39 hit the cap, TTFD median ~4150 ms — against 134 ms
+  /// in production on 1.2.25 (HealthKart, 58.5k requests). This is the same
+  /// trap _armTTFDTimeout documents for the CAP; 1.2.36 moved the cap out of
+  /// the frame path and left the settle timer behind in it.
+  ///
+  /// It is a FAST-device bug, not an iOS one. The lab's vivo is slow enough to
+  /// still be painting at registration, so _onFrame fires there and Android
+  /// looked healthy (63 of 80 settled). A fast Android handset regresses the
+  /// same way.
+  void _armSettleTimer() {
     _settleTimer?.cancel();
     _settleTimer = Timer(const Duration(milliseconds: _settleWindowMs), () {
+      if (_disposed || _ttfdCaptured) return;
       // A screen cannot be "fully drawn" before it has been drawn at all.
       // _onFrame is a TRANSIENT callback — it runs at the START of a frame —
       // while TTID is captured in that same frame's post-frame callback. On a
       // slow device a single heavy frame can outlast the settle window, so
       // firing here would report the frame's start as TTFD and produce a TTFD
       // that precedes TTID. Measured on a low-end device before this guard: 51
-      // of 61 beacons inverted. Wait for the frame to finish; the 5 s cap
-      // bounds this, so it cannot spin forever.
+      // of 61 beacons inverted. Wait for the frame to finish, re-arming until
+      // TTID lands; _ttfdTimeoutTimer bounds this, so it cannot spin forever.
+      // (1.2.36 retried exactly once and then captured regardless, which with
+      // the timer now armed before the first frame could report a -1.)
       if (!_ttidCaptured) {
-        _settleTimer = Timer(const Duration(milliseconds: _settleWindowMs), () {
-          _captureTTFD(_lastFrameElapsed, 'settled');
-        });
+        _armSettleTimer();
         return;
       }
-      _captureTTFD(_lastFrameElapsed, 'settled');
+      _captureTTFD(_settledElapsed, 'settled');
     });
-
-    // scheduleNewFrame: false — observe, never drive. See _startTTFDTracking.
-    SchedulerBinding.instance
-        .scheduleFrameCallback(_onFrame, scheduleNewFrame: false);
   }
 
   /// Records TTFD exactly once and shuts down both TTFD timers.
@@ -549,10 +620,12 @@ class _ScreenMetrics {
     _ttfdCaptured = true;
     _ttfdSource   = source;
     _cancelTTFDTimers();
-    orionPrint('✅ [$screenName] TTFD ($source): $_ttfd ms');
+    orionPrint('✅ [$screenName] TTFD ($source): $_ttfd ms '
+        '[frames=$_ttfdFrameCount lastFrame=$_lastFrameElapsed ttid=$_ttid]');
   }
 
   void _cancelTTFDTimers() {
+    _stopTimingsObservation();
     _settleTimer?.cancel();
     _settleTimer = null;
     _ttfdTimeoutTimer?.cancel();
