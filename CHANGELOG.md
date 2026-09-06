@@ -1,3 +1,18 @@
+## 1.2.38
+Android ANR fixes. Three pieces of SDK work that ran on your app's main thread have been
+moved off it, all three traced from production ANR reports:
+
+- a rendering frame was requested on every activity resume, and discarded unused after
+  the first
+- the session store was read from disk during `Application.onCreate`
+- the beacon was assembled on the main thread on every screen change
+
+No iOS or Dart changes in this release.
+
+✅ Dashboards: nothing to re-baseline. No reported value and no beacon field changes —
+this release is only about where the work runs, not what it measures. (Unlike 1.2.36 and
+1.2.37, which both moved TTFD.)
+
 ## 1.2.37
 TTFD fix. On devices that paint quickly, 1.2.36 reported TTFD as the 5 s timeout value
 instead of a real measurement, on both iOS and Android. **Please upgrade straight to
