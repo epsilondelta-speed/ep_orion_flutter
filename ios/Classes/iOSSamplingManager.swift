@@ -53,6 +53,9 @@ final class iOSSamplingManager {
     private let defaultFilterRawSa:  Bool   = false   // sa=false ⇒ filter ON
     private let defaultRefreshMin:   Int    = 15
     private let defaultConfigVer:    String = "1.0"
+    // Mirrors MIN_REFRESH_MIN in SamplingManager.kt. Was an inline max(1, ...)
+    // in startRefreshTimer; named in 1.2.39 because the disk cache clamps too.
+    private let minRefreshMin:       Int    = 1
 
     // MARK: - State (guarded by lock)
     // SDK-bundled fallback beacon URL. Used until first successful config fetch
@@ -75,6 +78,28 @@ final class iOSSamplingManager {
     private var resolvedBeaconURL:  String? = nil
 
     private let lock = NSLock()
+    // MARK: - Disk cache (1.2.39)
+    //
+    // Nothing persisted this config before 1.2.39: every cold start fetched the
+    // file again, and the Dart layer fetched it a second time. That
+    // unconditional per-launch pair was the floor under the CloudFront bill
+    // that no `crm` value could remove — the config object is 83% of all
+    // requests on the distribution. Dart now reads native's resolved snapshot
+    // over the channel, and this cache removes the remaining launch fetch
+    // whenever the app is relaunched inside its own crm window.
+    //
+    // Keyed by cid/pid so a re-init under different ids can never replay
+    // another company's config.
+    private let kCacheJSON  = "orion.cfg.json"
+    private let kCacheAt    = "orion.cfg.at"
+    private let kCacheOwner = "orion.cfg.owner"
+    private let kCacheCrm   = "orion.cfg.crm"
+
+    /// UserDefaults' first access faults the plist in from disk, so keep it off
+    /// the caller's thread — initialize() arrives on the platform thread.
+    private let cacheQueue = DispatchQueue(label: "co.epsilondelta.orion.cfgcache",
+                                           qos: .utility)
+
     private var refreshTimer: DispatchSourceTimer?
     private var currentTimerIntervalMin: Int = 15  // tracked so we know when to restart
 
@@ -93,8 +118,21 @@ final class iOSSamplingManager {
         self.resolvedConfigVer  = nil
         lock.unlock()
 
-        fetchConfig()
-        startRefreshTimer(intervalMin: defaultRefreshMin)
+        // 1.2.39 — cache first, network only if what is on disk has gone stale.
+        // No lock is held across this dispatch (WakeLockTracker invariant).
+        cacheQueue.async { [weak self] in
+            guard let self = self else { return }
+            if let freshForMin = self.loadCachedConfig() {
+                OrionLogger.debug("iOSSamplingManager: config served from cache — no CDN request (fresh for \(freshForMin)m)")
+                // Wake up when the STORED config actually goes stale, not a
+                // full crm from now, or a run of short launches would keep
+                // pushing the refresh over the horizon.
+                self.startRefreshTimer(intervalMin: freshForMin)
+            } else {
+                self.fetchConfig()
+                self.startRefreshTimer(intervalMin: self.defaultRefreshMin)
+            }
+        }
 
         OrionLogger.debug("iOSSamplingManager: initialized cid=\(cid) pid=\(pid) localRate=\(localRatePercent)%")
     }
@@ -205,7 +243,7 @@ final class iOSSamplingManager {
 
     private func startRefreshTimer(intervalMin: Int) {
         refreshTimer?.cancel()
-        let interval = TimeInterval(max(1, intervalMin) * 60)
+        let interval = TimeInterval(max(minRefreshMin, intervalMin) * 60)
         let timer = DispatchSource.makeTimerSource(
             queue: DispatchQueue.global(qos: .utility)
         )
@@ -265,6 +303,11 @@ final class iOSSamplingManager {
 
             OrionLogger.debug("iOSSamplingManager: config loaded — s=\(s) sa=\(sa) crm=\(crm) cv=\(cv) bu=\(bu)")
 
+            // Only a network response is written back. Replaying the cache must
+            // not renew its own timestamp, or a device that never reaches the
+            // CDN would keep the same config alive forever.
+            self.persistConfig(data, crm: crm)
+
             // Restart timer if crm changed. Done outside the lock; DispatchSourceTimer
             // cancel/recreate is safe to call from any queue.
             if needsTimerRestart {
@@ -272,6 +315,76 @@ final class iOSSamplingManager {
                 self.startRefreshTimer(intervalMin: crm)
             }
         }.resume()
+    }
+
+    // MARK: - Disk cache (1.2.39)
+
+    /// cid/pid the cache belongs to. A mismatch invalidates it outright.
+    private func cacheOwner() -> String {
+        lock.lock(); defer { lock.unlock() }
+        return "\(cid)/\(pid)"
+    }
+
+    /// Apply the cached config if one exists, belongs to this cid/pid and is
+    /// younger than the crm that was in force when it was stored.
+    ///
+    /// - Returns: minutes of freshness left, or nil if there was no usable
+    ///   cache — in which case the caller must fetch.
+    ///
+    /// ⚠️ Touches UserDefaults. cacheQueue only, never the platform thread.
+    private func loadCachedConfig() -> Int? {
+        let defaults = UserDefaults.standard
+        guard let data = defaults.data(forKey: kCacheJSON) else { return nil }
+
+        let owner = defaults.string(forKey: kCacheOwner)
+        guard owner == cacheOwner() else {
+            OrionLogger.debug("iOSSamplingManager: cache belongs to \(owner ?? "nil"), not \(cacheOwner()) — ignoring")
+            return nil
+        }
+
+        let storedAt = defaults.double(forKey: kCacheAt)
+        guard storedAt > 0 else { return nil }
+        let crm = max(defaults.integer(forKey: kCacheCrm), minRefreshMin)
+
+        // Wall clock, not uptime: this has to survive a reboot. A backwards
+        // clock change yields a negative age, clamped to 0 — still bounded by
+        // crm, so the worst case is one skipped refresh, never a frozen config.
+        let ageMin = max(0, Int((Date().timeIntervalSince1970 - storedAt) / 60.0))
+        guard ageMin < crm else {
+            OrionLogger.debug("iOSSamplingManager: cache is \(ageMin)m old, crm=\(crm)m — stale, fetching")
+            return nil
+        }
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        let sV   = resolveInt(json,    field: "s",   default: defaultPercent).clamped(to: 0...100)
+        let saV  = resolveBool(json,   field: "sa",  default: defaultFilterRawSa)
+        let crmV = resolveInt(json,    field: "crm", default: defaultRefreshMin)
+        let cvV  = resolveStringGlobal(json, field: "cv", default: defaultConfigVer)
+        let buV  = resolveBeaconURL(json)
+
+        lock.lock()
+        resolvedPercent    = sV
+        resolvedRawSa      = saV
+        resolvedRefreshMin = crmV
+        resolvedConfigVer  = cvV
+        resolvedBeaconURL  = buV
+        configLoaded       = true
+        lock.unlock()
+
+        OrionLogger.debug("iOSSamplingManager: config replayed from cache — s=\(sV) sa=\(saV) crm=\(crmV) cv=\(cvV)")
+        return max(crm - ageMin, minRefreshMin)
+    }
+
+    /// ⚠️ Touches UserDefaults. Called from the URLSession callback queue.
+    private func persistConfig(_ data: Data, crm: Int) {
+        let defaults = UserDefaults.standard
+        defaults.set(data,                          forKey: kCacheJSON)
+        defaults.set(cacheOwner(),                  forKey: kCacheOwner)
+        defaults.set(Date().timeIntervalSince1970,  forKey: kCacheAt)
+        defaults.set(max(crm, minRefreshMin),       forKey: kCacheCrm)
     }
 
     // MARK: - V2 Resolution helpers

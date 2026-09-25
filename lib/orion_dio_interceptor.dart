@@ -161,7 +161,18 @@ class OrionDioInterceptor extends Interceptor {
       // but kept here too so any future caller is safe.
       if (!SamplingManager.instance.isTrackingEnabled) return;
 
-      final startTime = options.extra['orion_startTime'] as int?;
+      // `extra` is the HOST's map. Never cast it — a host (or another
+      // interceptor) can put anything under any key, and `as int?` throws
+      // "type 'String' is not a subtype of type 'int?'", which the catch below
+      // swallows and the whole request record is silently dropped.
+      // 1.2.36 renamed the key (startTime -> orion_startTime) to fix the
+      // COLLISION; it did not fix the CAST. This does.
+      final rawStart  = options.extra['orion_startTime'];
+      final startTime = rawStart is int
+          ? rawStart
+          : (rawStart is num
+              ? rawStart.toInt()
+              : (rawStart is String ? int.tryParse(rawStart) : null));
       final endTime   = DateTime.now().millisecondsSinceEpoch;
 
       if (startTime == null) {
@@ -191,7 +202,10 @@ class OrionDioInterceptor extends Interceptor {
       // Orion hosts and self-disarms — a single bool check after first hit.
       OrionColdStart.maybeMarkFirstNetwork(options.uri.toString());
     } catch (e) {
-      orionPrint('⚠️ [Orion] _trackRequest error (ignored): $e');
+      // Name the request. Logging only `$e` made a field occurrence
+      // impossible to trace back to a URL even with full debug logging on.
+      orionPrint('⚠️ [Orion] _trackRequest error (ignored) for '
+          '${options.method} ${options.uri.path}: $e');
     }
   }
 

@@ -26,10 +26,39 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
 
     // MARK: - Plugin Registration
 
+    /// 1.2.39 — nil-registrar guard.
+    ///
+    /// `registrar` is typed non-optional, but this method is invoked from
+    /// Objective-C (`GeneratedPluginRegistrant`), and Objective-C can hand a
+    /// Swift non-optional parameter a nil. Swift performs no check on the way
+    /// in, so the first message send — `registrar.messenger()` — dereferences
+    /// null and the process takes SIGSEGV *at plugin registration*, before any
+    /// Orion code has run and before the host app can do anything about it.
+    /// Reproduced 3/3 on a physical iPhone against published 1.2.38.
+    ///
+    /// A plain `registrar == nil` cannot express this: the type is
+    /// non-optional, so the compiler folds the comparison to `false` and
+    /// removes it. Reinterpreting the reference as a raw pointer is the only
+    /// way to ask whether it is actually null.
+    ///
+    /// Degrading to a no-op is correct here — the SDK collects nothing, and the
+    /// host app launches instead of crashing. That is the invariant: Orion
+    /// never breaks the host.
     public static func register(with registrar: FlutterPluginRegistrar) {
+        guard unsafeBitCast(registrar, to: UnsafeRawPointer?.self) != nil else {
+            // OrionLogger is not safe to reach yet — its own <clinit>-equivalent
+            // may be what we are being called before. Stay on NSLog, and only
+            // in debug.
+            #if DEBUG
+            NSLog("[Orion] register(with:) received a nil registrar — skipping registration")
+            #endif
+            return
+        }
+
+        let messenger = registrar.messenger()
         let channel = FlutterMethodChannel(
             name: "orion_flutter",
-            binaryMessenger: registrar.messenger()
+            binaryMessenger: messenger
         )
         let instance = OrionFlutterPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
@@ -61,6 +90,12 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
         case "initializeEdOrion":           handleInit(args: args, result: result)
         case "getPlatformVersion":          result("iOS \(UIDevice.current.systemVersion)")
         case "getRuntimeMetrics":           handleGetRuntimeMetrics(result: result)
+        // 1.2.39 — Dart no longer fetches confOriSamplV2.json itself. Native
+        // already owns it (it needs `bu` before it can POST, and the crash path
+        // needs `s` when Dart may be gone), so Dart pulls the resolved snapshot
+        // from here instead of issuing a second identical CDN request on every
+        // launch. Pure in-memory read — no network, no disk.
+        case "getSamplingConfig":           handleGetSamplingConfig(result: result)
         case "onAppForeground":             handleAppForeground(result: result)
         case "onAppBackground":             handleAppBackground(result: result)
         case "onFlutterScreenStart":        handleScreenStart(args: args, result: result)
@@ -208,6 +243,22 @@ public class OrionFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     // MARK: - Runtime Metrics
+
+    /// Mirrors the Android "getSamplingConfig" handler exactly — same keys,
+    /// same meaning. `loaded` is false until native's own fetch (or its disk
+    /// cache) has resolved a config; Dart then stays on its hardcoded
+    /// fail-open defaults, precisely as it did while its old HTTP fetch was in
+    /// flight.
+    private func handleGetSamplingConfig(result: @escaping FlutterResult) {
+        let mgr = iOSSamplingManager.shared
+        // getConfigSnapshot() reads s/sa/crm/cv under one lock acquisition, so
+        // all four come from the same config evaluation — no torn read if a
+        // refresh lands mid-call.
+        var payload = mgr.getConfigSnapshot()
+        payload["bu"]     = mgr.beaconURL
+        payload["loaded"] = mgr.isConfigLoaded
+        result(payload)
+    }
 
     private func handleGetRuntimeMetrics(result: @escaping FlutterResult) {
         do {

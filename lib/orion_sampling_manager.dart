@@ -1,7 +1,6 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
-import 'package:http/http.dart' as http;
+import 'package:flutter/services.dart';
 import 'orion_logger.dart';
 
 /// SamplingManager — Remote runtime configuration for Orion Flutter SDK.
@@ -59,20 +58,34 @@ class SamplingManager {
   SamplingManager._();
 
   // ── Constants ─────────────────────────────────────────────────────────────
-  static const String _cdnUrl =
-      'https://cdn.epsilondelta.co/orion/confOriSamplV2.json';
-  static const Duration _fetchTimeout = Duration(seconds: 10);
+  // The CDN URL and its timeout moved to the native layer in 1.2.39 — Dart no
+  // longer makes this request. See _fetchConfig().
+  static const MethodChannel _channel = MethodChannel('orion_flutter');
+
+  // How soon to re-ask native for a config it has not resolved yet. Dart's
+  // initialize() runs BEFORE initializeEdOrion reaches native, so the first
+  // pull always arrives early; these local retries cover the window until
+  // native's own fetch lands, without waiting a full crm.
+  static const List<Duration> _earlyRetries = <Duration>[
+    Duration(seconds: 1),
+    Duration(seconds: 3),
+    Duration(seconds: 8),
+    Duration(seconds: 20),
+  ];
 
   // Defaults (used as fail-open fallbacks if CDN unreachable)
-  static const int     _defaultPercent      = 100;
+  // _defaultPercent removed in 1.2.39 — the 100% fail-open now lives in the
+  // native layer, which owns resolution. Dart's fallback while no config has
+  // arrived is localSampleRate, applied in getEffectivePercent().
   static const bool    _defaultShowAnalytics = false;
   static const int     _defaultRefreshMin    = 15;
   static const int     _minRefreshMin        = 1;
   static const String  _defaultConfigVersion = '1.0';
 
   // ── State ─────────────────────────────────────────────────────────────────
+  // cid/pid are forwarded to native, which resolves c[cid].p[pid]. Dart keeps
+  // _cid only to know whether initialize() has run (see _scheduleEarlyRetries).
   String  _cid             = '';
-  String  _pid             = '';
   double  _localSampleRate = 1.0;
 
   // Remote-resolved values. Null until first successful fetch.
@@ -104,7 +117,6 @@ class SamplingManager {
   void initialize(String cid, String pid, {double sampleRate = 1.0}) {
     try {
       _cid             = cid;
-      _pid             = pid;
       _localSampleRate = sampleRate.clamp(0.0, 1.0);
 
       // Reset all remote-resolved state on (re-)init.
@@ -120,8 +132,11 @@ class SamplingManager {
       _activeRefreshMin = _defaultRefreshMin;
       _scheduleRefresh(_activeRefreshMin);
 
-      // Kick off the first fetch immediately.
+      // Ask native immediately. It will usually answer `loaded: false` on this
+      // first call — initializeEdOrion has not reached native yet — so back it
+      // with a short local retry ladder rather than waiting a whole crm.
       _fetchConfig();
+      _scheduleEarlyRetries();
 
       orionPrint('SamplingManager: initialized '
           'cid=$cid pid=$pid localRate=${(sampleRate * 100).round()}%');
@@ -306,32 +321,47 @@ class SamplingManager {
 
   // ── CDN fetch ─────────────────────────────────────────────────────────────
 
+  /// Pull the resolved config from the native layer.
+  ///
+  /// 1.2.39 — this used to make its own HTTPS request to confOriSamplV2.json.
+  /// The native layer fetches the same file at the same moment, because it has
+  /// to: it needs `bu` before it can POST anything, and the crash/ANR path
+  /// needs `s` at a point where Dart may be gone. So every launch cost two
+  /// identical CDN requests, and the config object is 83% of all requests on
+  /// the distribution. Native is now the single owner; Dart reads its already
+  /// resolved snapshot over the channel — no network, no second request.
+  ///
+  /// Failure modes are unchanged. If the channel call fails, or native has not
+  /// resolved a config yet, the remote fields stay null and every getter falls
+  /// back to the same hardcoded defaults it used while the old HTTP fetch was
+  /// in flight. The first beacon always sends regardless.
   Future<void> _fetchConfig() async {
     try {
-      orionPrint('SamplingManager: fetching CDN config...');
+      final raw = await _channel.invokeMethod<dynamic>('getSamplingConfig');
+      if (raw is! Map) {
+        orionPrint('SamplingManager: no config from native — using fallback');
+        return;
+      }
+      final map = Map<String, dynamic>.from(raw);
 
-      final response = await http.get(
-        Uri.parse(_cdnUrl),
-        headers: {'Cache-Control': 'no-cache'},
-      ).timeout(_fetchTimeout);
-
-      if (response.statusCode != 200) {
-        orionPrint('SamplingManager: CDN returned '
-            '${response.statusCode} — using fallback');
+      // Native resolves c[cid].p[pid] -> c[cid] -> global itself, so the
+      // chain-walking resolvers are not used on this path — only the
+      // coercers, which must stay because the channel hands back platform
+      // types (Android int/bool, iOS NSNumber).
+      if (map['loaded'] != true) {
+        orionPrint('SamplingManager: native config not resolved yet — '
+            'staying on defaults');
         return;
       }
 
-      final Map<String, dynamic> json =
-      jsonDecode(response.body) as Map<String, dynamic>;
-
-      // Resolve all four pieces of state.
-      _remotePercent       = _resolvePercent(json);
-      _remoteShowAnalytics = _resolveShowAnalytics(json);
-      _remoteRefreshMin    = _resolveRefreshMin(json);
-      _remoteConfigVersion = _resolveConfigVersion(json);
+      _remotePercent       = _coercePercent(map['s']);
+      _remoteShowAnalytics = _coerceBool(map['sa']);
+      _remoteRefreshMin    = _coerceMinutes(map['crm']);
+      final cv             = map['cv'];
+      _remoteConfigVersion = cv is String && cv.isNotEmpty ? cv : null;
       _configLoaded        = true;
 
-      // Restart the staleness clock. Only on success — a timeout or a non-200
+      // Restart the staleness clock. Only on success — a failed channel call
       // must leave the config looking stale so the next foreground retries
       // rather than sitting on a value we failed to confirm.
       _sinceLastFetch
@@ -339,17 +369,28 @@ class SamplingManager {
         ..start();
 
       orionPrint(
-        'SamplingManager: config loaded — '
+        'SamplingManager: config from native — '
             's=$_remotePercent% sa=$_remoteShowAnalytics '
             'crm=${_remoteRefreshMin}m cv=$_remoteConfigVersion',
       );
 
       // Reschedule periodic refresh if crm changed.
       _maybeRescheduleRefresh(configRefreshMin);
-    } on TimeoutException {
-      orionPrint('SamplingManager: CDN timeout — using fallback');
     } catch (e) {
-      orionPrint('SamplingManager: CDN error — $e — using fallback');
+      orionPrint('SamplingManager: config channel error — $e — using fallback');
+    }
+  }
+
+  /// Ask native again, a few times, until it reports a resolved config.
+  /// Cancels itself as soon as one arrives or the attempts run out. Purely
+  /// local — each attempt is an in-memory read on the native side.
+  void _scheduleEarlyRetries() {
+    for (var i = 0; i < _earlyRetries.length; i++) {
+      Timer(_earlyRetries[i], () {
+        if (_configLoaded) return;
+        if (_cid.isEmpty) return;
+        _fetchConfig();
+      });
     }
   }
 
@@ -393,72 +434,16 @@ class SamplingManager {
     return null;
   }
 
-  // ── Field resolvers ───────────────────────────────────────────────────────
-
-  /// Generic resolver that walks the priority chain for a given field name.
-  /// Returns the first non-null coercion result, or null if nothing resolved.
-  T? _resolveField<T>(
-      Map<String, dynamic> config,
-      String fieldName,
-      T? Function(Object?) coerce,
-      ) {
-    if (_cid.isNotEmpty) {
-      final cidEntry = config['c']?[_cid];
-      if (cidEntry is Map) {
-        // 1. Product-level override
-        if (_pid.isNotEmpty) {
-          final productEntry = cidEntry['p']?[_pid];
-          if (productEntry is Map) {
-            final v = coerce(productEntry[fieldName]);
-            if (v != null) return v;
-          }
-        }
-        // 2. Company-level default
-        final v = coerce(cidEntry[fieldName]);
-        if (v != null) return v;
-      }
-    }
-    // 3. Global default
-    return coerce(config[fieldName]);
-  }
-
-  int _resolvePercent(Map<String, dynamic> config) {
-    final v = _resolveField(config, 's', _coercePercent);
-    if (v != null) {
-      orionPrint('SamplingManager: resolved s=$v');
-      return v;
-    }
-    orionPrint('SamplingManager: s not found — defaulting to '
-        '$_defaultPercent');
-    return _defaultPercent;
-  }
-
-  bool _resolveShowAnalytics(Map<String, dynamic> config) {
-    final v = _resolveField(config, 'sa', _coerceBool);
-    if (v != null) {
-      orionPrint('SamplingManager: resolved sa=$v');
-      return v;
-    }
-    return _defaultShowAnalytics;
-  }
-
-  int _resolveRefreshMin(Map<String, dynamic> config) {
-    final v = _resolveField(config, 'crm', _coerceMinutes);
-    if (v != null) {
-      // Clamp at read time to guarantee invariant, but log the raw value here.
-      final clamped = v < _minRefreshMin ? _minRefreshMin : v;
-      orionPrint('SamplingManager: resolved crm=$v '
-          '${clamped != v ? "(clamped to $clamped)" : ""}');
-      return v;
-    }
-    return _defaultRefreshMin;
-  }
-
-  /// `cv` is global-only — no resolution chain.
-  String _resolveConfigVersion(Map<String, dynamic> config) {
-    final raw = config['cv'];
-    if (raw is String && raw.isNotEmpty) return raw;
-    if (raw is num) return raw.toString();
-    return _defaultConfigVersion;
-  }
+  // ── Field resolvers: REMOVED in 1.2.39 ────────────────────────────────────
+  //
+  // Dart used to walk the c[cid].p[pid] -> c[cid] -> global chain itself,
+  // duplicating Kotlin's resolveField()/SamplingManager.swift's. Both copies
+  // had to stay behaviourally identical or the same CDN file would resolve to
+  // different sampling on the two platforms — a standing correctness risk that
+  // the old comments called out explicitly.
+  //
+  // Native now resolves the chain and Dart reads the resolved values over the
+  // channel, so there is exactly one implementation and the invariant holds by
+  // construction. The coercers above stay: the channel hands back platform
+  // types (Android int/bool, iOS NSNumber) which still need normalising.
 }
