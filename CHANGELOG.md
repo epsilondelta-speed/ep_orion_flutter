@@ -1,3 +1,38 @@
+## 1.2.39
+An iOS crash fix, a large cut in the SDK's own network requests, and more main-thread
+work removed on Android.
+
+- **iOS: the plugin could crash your app at registration.** In some hosts the Flutter
+  plugin registrant hands the registration callback a null value, which Swift does not
+  check; the SDK then dereferenced it and the process died at launch, before any Orion
+  code ran. The SDK now detects that and skips registering instead — it collects nothing
+  for that launch, and your app starts normally. **If you are on 1.2.38, this is the
+  reason to upgrade.**
+
+- **The SDK now makes far fewer config requests.** It fetched its remote configuration
+  twice on every launch — once from Dart and once from the native layer — and never
+  cached it between launches. The native layer is now the single owner, the Dart layer
+  reads the resolved values from it in-process, and both platforms keep the config on
+  disk and reuse it while it is still current. In practice: **two requests per launch
+  becomes one, and zero on a relaunch** within the refresh interval. No behaviour change
+  to sampling itself.
+
+- **Android: more main-thread work removed.** The memory tracker no longer takes a lock
+  that the main thread could wait on while a beacon was being built, and it no longer
+  does a native heap read during `Application.onCreate`. Both were traced from production
+  ANR reports.
+
+- **Android: the SDK no longer builds log messages in release builds.** 309 call sites
+  were constructing strings that were then discarded, including on the beacon path.
+
+- **Network records are no longer silently dropped.** If anything other than the SDK put
+  a value under its key in Dio's `RequestOptions.extra`, the SDK threw internally and lost
+  that request record. Measured at 0.88% of carried records in a customer build.
+
+⚠️ Dashboards: no beacon field changes and no reported value changes. One small thing to
+expect — because of the last item, **network request counts per screen may tick up
+slightly** (under 1%) where they were previously losing records. Nothing to re-baseline.
+
 ## 1.2.38
 Android ANR fixes. Three pieces of SDK work that ran on your app's main thread have been
 moved off it, all three traced from production ANR reports:
