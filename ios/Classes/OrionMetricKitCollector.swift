@@ -42,6 +42,10 @@ import MetricKit
 ///   frames still identify which binary was executing — app code vs UIKit vs
 ///   a third-party SDK — which is often enough to route an investigation.
 ///
+/// STACK ORDER (1.2.40): every stack is emitted leaf (innermost) frame first.
+///   Through 1.2.39, hang / CPU / disk-write stacks came out thread-entry
+///   first — see OrionMetricKitStack for the defect and the fix.
+///
 /// AVAILABILITY: iOS 14+. On earlier versions every entry point is a no-op.
 @objc final class OrionMetricKitCollector: NSObject {
 
@@ -66,6 +70,9 @@ import MetricKit
     /// 8 groups x 20 frames keeps the beacon around 6 KB worst case, in line
     /// with a normal screen beacon.
     private let maxGroups = 8
+
+    /// Distinct binaries listed in a beacon's `binaryImages`.
+    private let maxBinaryImages = 64
 
     /// Frames used to build a group's signature. Deeper than this and
     /// genuinely-identical hangs stop grouping because of minor tail
@@ -146,6 +153,17 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
 
     // MARK: - Payload processing (background queue only)
 
+    /// Flatten one diagnostic's tree. `entryFirstIfUnknown` is the orientation
+    /// to assume only when neither the frames nor `callStackPerThread` settle
+    /// it — see OrionMetricKitStack. Empty (not nil) when unparseable, so the
+    /// diagnostic is still reported, flagged `stackUnavailable`.
+    private func stack(of tree: MXCallStackTree, entryFirstIfUnknown: Bool) -> OrionMetricKitStack.Flat {
+        return OrionMetricKitStack.flatten(json: tree.jsonRepresentation(),
+                                           limit: maxFrames,
+                                           entryFirstIfUnknown: entryFirstIfUnknown)
+            ?? OrionMetricKitStack.Flat(frames: [], truncated: false, depth: 0, images: [:])
+    }
+
     private func process(_ payload: MXDiagnosticPayload) {
         // Skip payloads already handled — MetricKit can redeliver.
         let stamp = payload.timeStampEnd.timeIntervalSince1970
@@ -167,7 +185,7 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
                 diagType: "hang",
                 category: hangCategory(ms),
                 durationMs: ms,
-                stack: Self.flatten(d.callStackTree, limit: maxFrames) ?? [],
+                stack: stack(of: d.callStackTree, entryFirstIfUnknown: true),
                 extra: [:],
                 appVersion: d.applicationVersion,
                 osVersion:  d.metaData.osVersion,
@@ -187,7 +205,7 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
                 diagType: isWatchdog ? "watchdog" : "crash",
                 category: "critical",
                 durationMs: 0,
-                stack: Self.flatten(d.callStackTree, limit: maxFrames) ?? [],
+                stack: stack(of: d.callStackTree, entryFirstIfUnknown: false),
                 extra: extra,
                 appVersion: d.applicationVersion,
                 osVersion:  d.metaData.osVersion,
@@ -201,7 +219,7 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
                 diagType: "cpuException",
                 category: "severe",
                 durationMs: Int(d.totalCPUTime.converted(to: .milliseconds).value),
-                stack: Self.flatten(d.callStackTree, limit: maxFrames) ?? [],
+                stack: stack(of: d.callStackTree, entryFirstIfUnknown: true),
                 extra: [:],
                 appVersion: d.applicationVersion,
                 osVersion:  d.metaData.osVersion,
@@ -215,7 +233,7 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
                 diagType: "diskWriteException",
                 category: "mild",
                 durationMs: 0,
-                stack: Self.flatten(d.callStackTree, limit: maxFrames) ?? [],
+                stack: stack(of: d.callStackTree, entryFirstIfUnknown: true),
                 extra: ["bytesWritten": Int(d.totalWritesCaused.converted(to: .bytes).value)],
                 appVersion: d.applicationVersion,
                 osVersion:  d.metaData.osVersion,
@@ -239,7 +257,7 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
         let diagType:   String
         let category:   String
         let durationMs: Int
-        let stack:      [String]
+        let stack:      OrionMetricKitStack.Flat
         let extra:      [String: Any]
         /// SDK-09/10: the app version recorded on THIS diagnostic. Payload
         /// metadata was previously taken first-wins across a 24 h window in
@@ -258,7 +276,7 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
         var count:       Int
         var worstMs:     Int
         var totalMs:     Int
-        let stack:       [String]
+        let stack:       OrionMetricKitStack.Flat
         var extra:       [String: Any]
         let appVersion:  String?
         let osVersion:   String?
@@ -275,9 +293,9 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
         var byFp: [String: DiagGroup] = [:]
 
         for item in items {
-            let fp = Self.fingerprint(diagType: item.diagType,
-                                      stack: item.stack,
-                                      depth: fingerprintDepth)
+            let fp = OrionMetricKitStack.fingerprint(diagType: item.diagType,
+                                                     stack: item.stack.frames,
+                                                     depth: fingerprintDepth)
             if var g = byFp[fp] {
                 g.count   += 1
                 g.worstMs  = max(g.worstMs, item.durationMs)
@@ -329,44 +347,9 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
         }
     }
 
-    /// Deterministic signature from diagType + the top frames.
-    ///
-    /// FNV-1a rather than Swift's `hashValue`, which is seeded per-process and
-    /// would produce a different fingerprint on every launch — useless for
-    /// grouping across sessions or devices.
-    static func fingerprint(diagType: String, stack: [String], depth: Int) -> String {
-        var input = diagType
-
-        // SDK-05: hash BINARY NAMES ONLY, never the offsets.
-        //
-        // offsetIntoBinaryTextSegment shifts whenever code moves, so
-        // including it made the same bug produce a different fingerprint on
-        // every app build — and, because system-binary offsets shift too, on
-        // every iOS point release. One bug fragmented across
-        // (builds x iOS versions) in the issue list.
-        //
-        // Offsets stay in the emitted stack[] for future symbolication; they
-        // are simply excluded from the fingerprint input.
-        //
-        // NOTE: system frames are deliberately KEPT here, unlike the
-        // Android/Flutter fingerprinting rule. Once offsets are stripped, the
-        // binary *sequence* (libsystem_kernel -> pthread -> c -> c++abi ->
-        // objc = an ObjC-exception abort) is the only remaining signal.
-        for frame in stack.prefix(depth) {
-            let binary = frame.components(separatedBy: " +0x").first ?? frame
-            input += "|" + binary
-        }
-
-        var hash: UInt64 = 0xcbf29ce484222325
-        for byte in input.utf8 {
-            hash ^= UInt64(byte)
-            hash = hash &* 0x100000001b3
-        }
-        // SDK-13: zero-pad. String(_:radix:) drops leading zeros, so roughly
-        // 1 fingerprint in 16 was shorter than 16 chars — breaking anything
-        // that indexes, joins or validates on fixed width.
-        return String(format: "%016llx", hash)
-    }
+    // Fingerprinting lives in OrionMetricKitStack.fingerprint (1.2.40), so it
+    // can be unit-tested without MetricKit. Same FNV-1a over diagType + the
+    // top binary names as before; `<unknown…>` labels now hash as `<unknown>`.
 
     // MARK: - Beacon assembly
 
@@ -435,6 +418,19 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
         if let os = kept.first?.osVersion  { beacon["diagOsVer"]  = os }
         if let dv = kept.first?.device     { beacon["diagDevice"] = dv }
 
+        // 1.2.40: binaryName → binaryUUID for every binary in the emitted
+        // stacks. Symbolication matches a dSYM by UUID; before this the UUID
+        // was read and thrown away, so these stacks could never be resolved.
+        // Beacon-level and de-duplicated across groups: a handful of binaries,
+        // a few hundred bytes. Capped so a pathological payload stays bounded.
+        var images: [String: String] = [:]
+        for g in kept {
+            for (name, uuid) in g.stack.images where images.count < maxBinaryImages {
+                images[name] = uuid
+            }
+        }
+        if !images.isEmpty { beacon["binaryImages"] = images }
+
         beacon["diagnostics"] = kept.map { g -> [String: Any] in
             var d: [String: Any] = [
                 "fp":       g.fingerprint,
@@ -444,10 +440,14 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
             ]
             if g.worstMs > 0 { d["worstMs"] = g.worstMs }
             if g.totalMs > 0 { d["totalMs"] = g.totalMs }
-            if !g.stack.isEmpty {
-                d["stack"]          = g.stack
-                d["stackFrames"]    = g.stack.count
-                d["stackTruncated"] = g.stack.count >= maxFrames
+            if !g.stack.frames.isEmpty {
+                // Leaf (innermost) frame first for EVERY diagType from 1.2.40.
+                // Before, hang/CPU/disk stacks were thread-entry first.
+                d["stack"]          = g.stack.frames
+                d["stackFrames"]    = g.stack.frames.count
+                // From the full walk, not `count >= maxFrames`: a stack of
+                // exactly 20 frames is not truncated.
+                d["stackTruncated"] = g.stack.truncated
                 // Frames are binaryName + offset; symbolication needs the
                 // dSYM and happens server-side. The fingerprint above uses
                 // binary names only — offsets are not build-stable.
@@ -477,49 +477,8 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
     }
 
 
-    // MARK: - Call-stack tree flattening
-
-    /// Convert an MXCallStackTree into an ordered list of
-    /// "binaryName +0xOFFSET" strings, outermost frame first.
-    ///
-    /// MetricKit models a stack as a tree (`subFrames`) because a payload can
-    /// aggregate several samples. For a single diagnostic there is normally
-    /// one dominant path, so we follow the highest-sampled child at each level
-    /// to recover a linear stack.
-    ///
-    /// Returns nil when the tree cannot be parsed — never throws. A diagnostic
-    /// without a stack is still worth reporting.
-    static func flatten(_ tree: MXCallStackTree, limit: Int) -> [String]? {
-        let data = tree.jsonRepresentation()
-        guard !data.isEmpty,
-              let root = (try? JSONSerialization.jsonObject(with: data))
-                          as? [String: Any],
-              let stacks = root["callStacks"] as? [[String: Any]]
-        else { return nil }
-
-        // Prefer the thread MetricKit attributed the problem to.
-        let chosen = stacks.first { ($0["threadAttributed"] as? Bool) == true }
-                     ?? stacks.first
-        guard let rootFrames = chosen?["callStackRootFrames"] as? [[String: Any]]
-        else { return nil }
-
-        var out: [String] = []
-        var level = rootFrames
-
-        while !level.isEmpty && out.count < limit {
-            guard let frame = level.max(by: {
-                (($0["sampleCount"] as? Int) ?? 0) < (($1["sampleCount"] as? Int) ?? 0)
-            }) else { break }
-
-            let name   = (frame["binaryName"] as? String) ?? "<unknown>"
-            let offset = (frame["offsetIntoBinaryTextSegment"] as? Int) ?? 0
-            out.append("\(name) +0x" + String(offset, radix: 16))
-
-            level = (frame["subFrames"] as? [[String: Any]]) ?? []
-        }
-
-        return out
-    }
+    // Call-stack flattening lives in OrionMetricKitStack.flatten (1.2.40) —
+    // see that file for why MetricKit trees come in two orientations.
 
     // MARK: - Watchdog detection
 
