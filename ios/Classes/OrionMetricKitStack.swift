@@ -68,8 +68,13 @@ enum OrionMetricKitStack {
     ///     nor the flag decide it — true for hang / CPU / disk diagnostics.
     /// - Returns: nil when the tree cannot be parsed. Never throws.
     static func flatten(json data: Data, limit: Int, entryFirstIfUnknown: Bool) -> Flat? {
+        // 1.2.41: JSONSerialization refuses nesting deeper than 512 levels — a
+        // MetricKit stack deeper than 254 frames, i.e. most stack overflows,
+        // which went out with no stack. OrionDeepJSON parses what it rejects;
+        // every tree it accepts takes exactly the same path as before.
         guard !data.isEmpty,
-              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let parsed = (try? JSONSerialization.jsonObject(with: data)) ?? OrionDeepJSON.parse(data),
+              let root = parsed as? [String: Any],
               let stacks = root["callStacks"] as? [[String: Any]]
         else { return nil }
 

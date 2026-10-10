@@ -425,7 +425,11 @@ extension OrionMetricKitCollector: MXMetricManagerSubscriber {
         // a few hundred bytes. Capped so a pathological payload stays bounded.
         var images: [String: String] = [:]
         for g in kept {
-            for (name, uuid) in g.stack.images where images.count < maxBinaryImages {
+            // Sorted (1.2.41): dictionary order is unspecified, so WHICH
+            // binaries survived the cap varied run to run. Same rule as the
+            // native SDK (decision D-17a).
+            for (name, uuid) in g.stack.images.sorted(by: { $0.key < $1.key })
+                where images.count < maxBinaryImages {
                 images[name] = uuid
             }
         }
