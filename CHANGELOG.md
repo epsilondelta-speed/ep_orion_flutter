@@ -1,3 +1,13 @@
+## 1.2.40
+One iOS fix to the OS-reported diagnostics (MetricKit) the SDK forwards.
+
+- **iOS: hang, CPU and disk-write stacks were reported upside down.** For those three
+  diagnostic types the stack started at the thread's entry point and the innermost frames
+  — the code that was actually running — were cut off, so unrelated problems were grouped
+  together. Every diagnostic stack is now reported innermost frame first, and each report
+  carries the binary UUIDs needed to symbolicate it later. Crash and watchdog reports are
+  unchanged. No action needed beyond upgrading; no Dart or Android change.
+
 ## 1.2.39
 An iOS crash fix, a large cut in the SDK's own network requests, and more main-thread
 work removed on Android.
