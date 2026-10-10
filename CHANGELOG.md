@@ -1,3 +1,18 @@
+## 1.2.41
+Android main-thread fixes from customer ANR reports, and an iOS fix for very deep
+diagnostic stacks.
+
+- **Android: less work on the main thread.** The SDK no longer writes an unused
+  setting to disk on the main thread every time a screen stops, and its background
+  disk writes no longer make Android wait for them when an activity stops. The SDK's
+  classes are now loaded on a background thread at app start, before the Flutter engine
+  is created, instead of on the main thread during plugin registration. Runtime metrics
+  for a screen are gathered off the main thread, and a battery-metrics lock is no longer
+  held while formatting.
+- **iOS: diagnostic stacks deeper than 254 frames were dropped.** Very deep stacks, typical
+  of stack overflows, arrived without a stack. They are now reported in full.
+- No API change and no action needed beyond upgrading.
+
 ## 1.2.40
 One iOS fix to the OS-reported diagnostics (MetricKit) the SDK forwards.
 
