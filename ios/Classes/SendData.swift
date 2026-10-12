@@ -223,20 +223,16 @@ struct OrionConfig {
     static var companyId: String = ""
     static var projectId: String = ""
 
-    /// SDK version — read from the SDK bundle's CFBundleShortVersionString so it
-    /// is always in sync with the podspec version, exactly as Android reads it from
-    /// BuildConfig.ORION_SDK_VERSION (injected by build.gradle's orionSdkVersion).
-    /// Falls back to a hardcoded string only if the bundle lookup fails.
-    static let sdkVersion: String = {
-        // Bundle.module refers to the resource bundle for the Swift package / pod.
-        // For a CocoaPod, Bundle(for:) with any class from the SDK resolves the
-        // correct bundle even when the pod is embedded as a static or dynamic framework.
-        let bundle = Bundle(identifier: "co.epsilondelta.orion-flutter")
-            ?? Bundle(for: OrionFlutterPluginMarker.self)
-        return bundle.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.2.10"
-    }()
+    /// SDK version reported as `libVer`: a compile-time constant, the iOS
+    /// counterpart of Android's BuildConfig.ORION_SDK_VERSION.
+    ///
+    /// 1.2.42: until now this was read from a Bundle on the first beacon, on the
+    /// main thread. `Bundle(identifier: "co.epsilondelta.orion-flutter")` never
+    /// matched (CocoaPods names the framework `org.cocoapods.orion-flutter`), and
+    /// a miss makes NSBundle search the app's frameworks on disk: 2.1 s of main
+    /// thread on an iPhone 13 in BigBasket 8.42.0, 107 ms on a simulator. The
+    /// `Bundle(for:)` fallback then returned the HOST APP's bundle under static
+    /// linkage, so `libVer` carried the app's own version. Never read the
+    /// version from a Bundle at runtime.
+    static let sdkVersion: String = OrionSDKVersion.current
 }
-
-// Marker class used solely for Bundle(for:) lookup above.
-// Must be in the same module as OrionFlutterPlugin.
-private final class OrionFlutterPluginMarker {}
