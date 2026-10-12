@@ -1,3 +1,17 @@
+## 1.2.42
+iOS fix for a main-thread hang on the first screen of each launch. No code changes are
+needed in your app: update the dependency to this version and run `pod install`.
+
+- **iOS: fixed a hang of up to several seconds on the first screen beacon.** The SDK
+  read its own version through an iOS framework lookup that ran on the main thread and
+  searched all of the app's frameworks on disk. In large apps this blocked the main
+  thread for 2–5 s on some launches. Seen in Xcode Organizer as
+  `OrionConfig.sdkVersion` → `+[NSBundle bundleWithIdentifier:]`. The version is now
+  built into the SDK and is read without any lookup. Affects every release up to 1.2.41.
+- **iOS: correct SDK version on statically linked apps.** Apps that link pods
+  statically (`use_frameworks! :linkage => :static`) reported the app's own version as
+  the SDK version. They now report the SDK version.
+
 ## 1.2.41
 Android main-thread fixes from customer ANR reports, and an iOS fix for very deep
 diagnostic stacks.
